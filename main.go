@@ -206,6 +206,7 @@ const (
 var (
 	socks5RRIndex        uint32
 	socks5RateLimitIndex uint32 // 0 表示直连，1..n 表示 socks5Proxies[n-1]
+	socks5LastRRLabel    string // 最近一次轮询选中的代理标签
 )
 
 var (
@@ -247,6 +248,7 @@ func getHTTPClient(stream bool) *http.Client {
 		proxy = socks5Proxies[idx]
 		useRR = true
 		selectedAddr = proxy.Addr
+		socks5LastRRLabel = socks5ProxyLabel(proxy)
 	} else if activeSocks5 == socks5RateLimitSwitch || activeSocks5 == socks5RateLimitSwitchNoDirect {
 		var ok bool
 		proxy, ok = currentRateLimitProxyLocked(activeSocks5 == socks5RateLimitSwitch)
@@ -328,6 +330,13 @@ func currentRateLimitProxyLocked(includeDirect bool) (Socks5Proxy, bool) {
 	return socks5Proxies[idx], true
 }
 
+func socks5ProxyLabel(p Socks5Proxy) string {
+	if p.Name != "" {
+		return p.Name + " (" + p.Addr + ")"
+	}
+	return p.Addr
+}
+
 func socks5ExitLabelLocked(idx int, includeDirect bool) string {
 	if includeDirect && idx <= 0 {
 		return "direct"
@@ -349,6 +358,16 @@ func socks5ExitLabelLocked(idx int, includeDirect bool) string {
 func currentSocks5ExitLabel() string {
 	socks5Mu.RLock()
 	defer socks5Mu.RUnlock()
+	// 轮询模式：返回最近一次轮询选中的代理标签
+	if activeSocks5 == socks5RR {
+		if socks5LastRRLabel != "" {
+			return socks5LastRRLabel
+		}
+		if len(socks5Proxies) == 0 {
+			return "direct"
+		}
+		return socks5ProxyLabel(socks5Proxies[0])
+	}
 	includeDirect := activeSocks5 == socks5RateLimitSwitch
 	total := len(socks5Proxies)
 	if includeDirect {
@@ -3037,9 +3056,10 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 			retryDelay = 1 * time.Second
 			continue
 		}
+		c := getHTTPClient(false)
 		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s exit=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), currentSocks5ExitLabel())
 		startTTFB := time.Now()
-		resp, err := getHTTPClient(false).Do(up)
+		resp, err := c.Do(up)
 		if err != nil {
 			if err := waitForRetry(ctx, retryDelay, ""); err != nil {
 				return nil, 0, nil, err
@@ -3147,9 +3167,10 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 			retryDelay = 1 * time.Second
 			continue
 		}
+		c := getHTTPClient(true)
 		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s exit=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), currentSocks5ExitLabel())
 		startTTFB := time.Now()
-		resp, err := getHTTPClient(true).Do(up)
+		resp, err := c.Do(up)
 		if err != nil {
 			if err := waitForRetry(ctx, retryDelay, ""); err != nil {
 				return nil, 0, nil, err
