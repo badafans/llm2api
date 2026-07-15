@@ -53,374 +53,212 @@ type Socks5Proxy struct {
 // Billing header regex for stripping Anthropic system message headers
 var reBillingHeader = regexp.MustCompile(`(?m)^x-anthropic-billing-header:\s*.*$`)
 
-func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr string) (net.Conn, error) {
+var (
+	socks5Proxies []Socks5Proxy
+	socks5Mu      sync.RWMutex
+)
+
+type socks5ClientKey struct {
+	Addr     string
+	Username string
+	Password string
+	Stream   bool
+}
+
+var (
+	socks5ClientsMu sync.Mutex
+	socks5Clients   = map[socks5ClientKey]*http.Client{}
+)
+
+func socks5Dial(proxy Socks5Proxy) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, target string) (net.Conn, error) {
-		conn, err := net.DialTimeout("tcp", proxy.Addr, 10*time.Second)
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err := dialer.DialContext(ctx, network, proxy.Addr)
 		if err != nil {
 			return nil, fmt.Errorf("socks5 connect to %s: %w", proxy.Addr, err)
 		}
+		fail := func(format string, args ...any) (net.Conn, error) {
+			conn.Close()
+			return nil, fmt.Errorf(format, args...)
+		}
+
 		deadline := time.Now().Add(15 * time.Second)
-		conn.SetDeadline(deadline)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		if err := conn.SetDeadline(deadline); err != nil {
+			return fail("socks5 set deadline: %w", err)
+		}
 
-		// 认证方法协商
-		auth := byte(0x00) // no auth
+		authMethod := byte(0x00)
 		if proxy.Username != "" {
-			auth = 0x02 // username/password
+			authMethod = 0x02
 		}
-		if _, err := conn.Write([]byte{0x05, 0x01, auth}); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5 handshake write: %w", err)
+		if _, err := conn.Write([]byte{0x05, 0x01, authMethod}); err != nil {
+			return fail("socks5 handshake write: %w", err)
 		}
-		buf := make([]byte, 2)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5 handshake read: %w", err)
+		handshake := make([]byte, 2)
+		if _, err := io.ReadFull(conn, handshake); err != nil {
+			return fail("socks5 handshake read: %w", err)
 		}
-		if buf[0] != 0x05 {
-			conn.Close()
-			return nil, fmt.Errorf("socks5: not socks5 protocol")
+		if handshake[0] != 0x05 {
+			return fail("socks5: unexpected protocol version 0x%02x", handshake[0])
 		}
-
-		// 用户名/密码认证
-		if buf[1] == 0x02 {
+		switch handshake[1] {
+		case 0x00:
+		case 0x02:
 			if proxy.Username == "" {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: server requires auth but no credentials")
+				return fail("socks5: server requires authentication")
 			}
-			ulen := len(proxy.Username)
-			plen := len(proxy.Password)
-			authBuf := make([]byte, 3+ulen+plen)
-			authBuf[0] = 0x01
-			authBuf[1] = byte(ulen)
-			copy(authBuf[2:], proxy.Username)
-			authBuf[2+ulen] = byte(plen)
-			copy(authBuf[3+ulen:], proxy.Password)
-			if _, err := conn.Write(authBuf); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5 auth write: %w", err)
+			if len(proxy.Username) > 255 || len(proxy.Password) > 255 {
+				return fail("socks5: username or password is too long")
 			}
-			authResp := make([]byte, 2)
-			if _, err := io.ReadFull(conn, authResp); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5 auth read: %w", err)
+			auth := []byte{0x01, byte(len(proxy.Username))}
+			auth = append(auth, proxy.Username...)
+			auth = append(auth, byte(len(proxy.Password)))
+			auth = append(auth, proxy.Password...)
+			if _, err := conn.Write(auth); err != nil {
+				return fail("socks5 auth write: %w", err)
 			}
-			if authResp[1] != 0x00 {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: auth failed")
+			authResponse := make([]byte, 2)
+			if _, err := io.ReadFull(conn, authResponse); err != nil {
+				return fail("socks5 auth read: %w", err)
 			}
-		} else if buf[1] != 0x00 {
-			conn.Close()
-			return nil, fmt.Errorf("socks5: unsupported auth method 0x%02x", buf[1])
-		}
-
-		// CONNECT 请求
-		host, portStr, err := net.SplitHostPort(target)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5: invalid target %s: %w", target, err)
-		}
-		port := 0
-		fmt.Sscanf(portStr, "%d", &port)
-
-		req := []byte{0x05, 0x01, 0x00} // VER, CMD=CONNECT, RSV
-		ip := net.ParseIP(host)
-		if ip != nil {
-			if ip4 := ip.To4(); ip4 != nil {
-				req = append(req, 0x01) // IPv4
-				req = append(req, ip4...)
-			} else {
-				req = append(req, 0x04) // IPv6
-				req = append(req, ip.To16()...)
-			}
-		} else {
-			if len(host) > 255 {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: hostname too long")
-			}
-			req = append(req, 0x03) // Domain
-			req = append(req, byte(len(host)))
-			req = append(req, []byte(host)...)
-		}
-		req = append(req, byte(port>>8), byte(port))
-
-		if _, err := conn.Write(req); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5 connect write: %w", err)
-		}
-
-		// 读取响应
-		resp := make([]byte, 4)
-		if _, err := io.ReadFull(conn, resp); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5 connect read: %w", err)
-		}
-		if resp[1] != 0x00 {
-			conn.Close()
-			return nil, fmt.Errorf("socks5: connect failed, status 0x%02x", resp[1])
-		}
-
-		// 读取绑定地址
-		switch resp[3] {
-		case 0x01: // IPv4
-			if _, err := io.ReadFull(conn, make([]byte, 4+2)); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: read bind ipv4: %w", err)
-			}
-		case 0x03: // Domain
-			dlen := make([]byte, 1)
-			if _, err := io.ReadFull(conn, dlen); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: read bind domain len: %w", err)
-			}
-			if _, err := io.ReadFull(conn, make([]byte, int(dlen[0])+2)); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: read bind domain: %w", err)
-			}
-		case 0x04: // IPv6
-			if _, err := io.ReadFull(conn, make([]byte, 16+2)); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: read bind ipv6: %w", err)
+			if authResponse[1] != 0x00 {
+				return fail("socks5: authentication failed")
 			}
 		default:
-			conn.Close()
-			return nil, fmt.Errorf("socks5: unknown address type 0x%02x", resp[3])
+			return fail("socks5: unsupported authentication method 0x%02x", handshake[1])
 		}
 
-		conn.SetDeadline(time.Time{})
+		host, portText, err := net.SplitHostPort(target)
+		if err != nil {
+			return fail("socks5: invalid target %s: %w", target, err)
+		}
+		portNumber, err := strconv.Atoi(portText)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return fail("socks5: invalid target port %q", portText)
+		}
+		request := []byte{0x05, 0x01, 0x00}
+		if ip := net.ParseIP(host); ip != nil {
+			if ipv4 := ip.To4(); ipv4 != nil {
+				request = append(request, 0x01)
+				request = append(request, ipv4...)
+			} else {
+				request = append(request, 0x04)
+				request = append(request, ip.To16()...)
+			}
+		} else {
+			if len(host) == 0 || len(host) > 255 {
+				return fail("socks5: invalid target hostname")
+			}
+			request = append(request, 0x03, byte(len(host)))
+			request = append(request, host...)
+		}
+		request = append(request, byte(portNumber>>8), byte(portNumber))
+		if _, err := conn.Write(request); err != nil {
+			return fail("socks5 connect write: %w", err)
+		}
+
+		response := make([]byte, 4)
+		if _, err := io.ReadFull(conn, response); err != nil {
+			return fail("socks5 connect read: %w", err)
+		}
+		if response[0] != 0x05 || response[1] != 0x00 {
+			return fail("socks5: connect failed, status 0x%02x", response[1])
+		}
+		addressLength := 0
+		switch response[3] {
+		case 0x01:
+			addressLength = 4
+		case 0x03:
+			length := make([]byte, 1)
+			if _, err := io.ReadFull(conn, length); err != nil {
+				return fail("socks5: read bind hostname length: %w", err)
+			}
+			addressLength = int(length[0])
+		case 0x04:
+			addressLength = 16
+		default:
+			return fail("socks5: unknown bind address type 0x%02x", response[3])
+		}
+		if _, err := io.ReadFull(conn, make([]byte, addressLength+2)); err != nil {
+			return fail("socks5: read bind address: %w", err)
+		}
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			return fail("socks5 clear deadline: %w", err)
+		}
 		return conn, nil
 	}
 }
 
-var (
-	socks5Proxies []Socks5Proxy
-	activeSocks5  string // 启用的代理 Addr；空表示直连；特殊值表示轮询/429 切换
-	socks5Mu      sync.RWMutex
-)
-
-const (
-	socks5RR                      = "__round_robin__"
-	socks5RateLimitSwitch         = "__rate_limit_switch__"
-	socks5RateLimitSwitchNoDirect = "__rate_limit_switch_no_direct__"
-)
-
-var (
-	socks5RRIndex        uint32
-	socks5RateLimitIndex uint32 // 0 表示直连，1..n 表示 socks5Proxies[n-1]
-	socks5LastRRLabel    string // 最近一次轮询选中的代理标签
-)
-
-var (
-	socks5Client           *http.Client // 缓存的 SOCKS5 非流式客户端
-	socks5ClientAddr       string       // 缓存对应的代理地址
-	socks5StreamClient     *http.Client // 缓存的 SOCKS5 流式客户端
-	socks5StreamClientAddr string       // 缓存对应的代理地址
-)
-
-func getHTTPClient(stream bool) *http.Client {
-	socks5Mu.Lock()
-	defer socks5Mu.Unlock()
-
-	if activeSocks5 == "" {
-		if stream {
-			return streamHTTPClient
-		}
-		return httpClient
-	}
-
-	var proxy Socks5Proxy
-	var useRR bool
-	selectedAddr := activeSocks5
-	cachedClient := socks5Client
-	cachedClientAddr := socks5ClientAddr
-	if stream {
-		cachedClient = socks5StreamClient
-		cachedClientAddr = socks5StreamClientAddr
-	}
-
-	if activeSocks5 == socks5RR {
-		if len(socks5Proxies) == 0 {
-			if stream {
-				return streamHTTPClient
-			}
-			return httpClient
-		}
-		idx := atomic.AddUint32(&socks5RRIndex, 1) % uint32(len(socks5Proxies))
-		proxy = socks5Proxies[idx]
-		useRR = true
-		selectedAddr = proxy.Addr
-		socks5LastRRLabel = socks5ProxyLabel(proxy)
-	} else if activeSocks5 == socks5RateLimitSwitch || activeSocks5 == socks5RateLimitSwitchNoDirect {
-		var ok bool
-		proxy, ok = currentRateLimitProxyLocked(activeSocks5 == socks5RateLimitSwitch)
-		if !ok {
-			if stream {
-				return streamHTTPClient
-			}
-			return httpClient
-		}
-		selectedAddr = proxy.Addr
-		// Rate-limit mode: always rebuild client, don't cache
-	} else {
-		if cachedClient != nil && cachedClientAddr == selectedAddr {
-			return cachedClient
-		}
-
-		var found bool
-		for i := range socks5Proxies {
-			if socks5Proxies[i].Addr == activeSocks5 {
-				proxy = socks5Proxies[i]
-				found = true
-				break
-			}
-		}
-		if !found {
-			if stream {
-				return streamHTTPClient
-			}
-			return httpClient
-		}
-	}
-
-	// Rate-limit mode: always rebuild client, don't use cache
-	if activeSocks5 == socks5RateLimitSwitch || activeSocks5 == socks5RateLimitSwitchNoDirect {
-		// skip cache check
-	} else if !useRR && cachedClient != nil && cachedClientAddr == selectedAddr {
-		return cachedClient
-	}
-
-	dial := socks5Dial(proxy)
-	client := &http.Client{
-		Timeout: map[bool]time.Duration{true: 0, false: 600 * time.Second}[stream],
-		Transport: &http.Transport{
-			DialContext:         dial,
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
-
-	// Only cache for non-rate-limit modes
-	if activeSocks5 != socks5RateLimitSwitch && activeSocks5 != socks5RateLimitSwitchNoDirect && !useRR {
-		if stream {
-			socks5StreamClient = client
-			socks5StreamClientAddr = selectedAddr
-		} else {
-			socks5Client = client
-			socks5ClientAddr = selectedAddr
-		}
-	}
-	return client
-}
-
-func currentRateLimitProxyLocked(includeDirect bool) (Socks5Proxy, bool) {
-	total := len(socks5Proxies)
-	if includeDirect {
-		total++
-	}
-	if total <= 0 {
+func configuredSocks5Proxy(addr string) (Socks5Proxy, bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
 		return Socks5Proxy{}, false
 	}
-	idx := int(atomic.LoadUint32(&socks5RateLimitIndex)) % total
-	if includeDirect && idx == 0 {
-		return Socks5Proxy{}, false
+	socks5Mu.RLock()
+	defer socks5Mu.RUnlock()
+	for _, proxy := range socks5Proxies {
+		if proxy.Addr == addr {
+			return proxy, true
+		}
 	}
-	if includeDirect {
-		return socks5Proxies[idx-1], true
-	}
-	return socks5Proxies[idx], true
+	return Socks5Proxy{}, false
 }
 
-func socks5ProxyLabel(p Socks5Proxy) string {
-	if p.Name != "" {
-		return p.Name + " (" + p.Addr + ")"
-	}
-	return p.Addr
-}
-
-func socks5ExitLabelLocked(idx int, includeDirect bool) string {
-	if includeDirect && idx <= 0 {
-		return "direct"
-	}
-	proxyIdx := idx
-	if includeDirect {
-		proxyIdx = idx - 1
-	}
-	if proxyIdx < 0 || proxyIdx >= len(socks5Proxies) {
-		return "direct"
-	}
-	proxy := socks5Proxies[proxyIdx]
+func socks5ProxyLabel(proxy Socks5Proxy) string {
 	if proxy.Name != "" {
 		return proxy.Name + " (" + proxy.Addr + ")"
 	}
 	return proxy.Addr
 }
 
-func currentSocks5ExitLabel() string {
-	socks5Mu.RLock()
-	defer socks5Mu.RUnlock()
-	// 轮询模式：返回最近一次轮询选中的代理标签
-	if activeSocks5 == socks5RR {
-		if socks5LastRRLabel != "" {
-			return socks5LastRRLabel
+func getModelHTTPClient(proxyAddr string, stream bool) (*http.Client, string) {
+	proxy, ok := configuredSocks5Proxy(proxyAddr)
+	if !ok {
+		if stream {
+			return streamHTTPClient, "direct"
 		}
-		if len(socks5Proxies) == 0 {
-			return "direct"
-		}
-		return socks5ProxyLabel(socks5Proxies[0])
+		return httpClient, "direct"
 	}
-	includeDirect := activeSocks5 == socks5RateLimitSwitch
-	total := len(socks5Proxies)
-	if includeDirect {
-		total++
+	key := socks5ClientKey{
+		Addr:     proxy.Addr,
+		Username: proxy.Username,
+		Password: proxy.Password,
+		Stream:   stream,
 	}
-	if total <= 0 {
-		return "direct"
+	socks5ClientsMu.Lock()
+	defer socks5ClientsMu.Unlock()
+	if client := socks5Clients[key]; client != nil {
+		return client, socks5ProxyLabel(proxy)
 	}
-	idx := int(atomic.LoadUint32(&socks5RateLimitIndex)) % total
-	return socks5ExitLabelLocked(idx, includeDirect)
+	transport := newBaseTransport()
+	transport.DialContext = socks5Dial(proxy)
+	client := &http.Client{Transport: transport, Timeout: 600 * time.Second}
+	if stream {
+		client.Timeout = 0
+	}
+	socks5Clients[key] = client
+	return client, socks5ProxyLabel(proxy)
 }
 
-func socks5RateLimitAttemptCount() int {
-	socks5Mu.RLock()
-	defer socks5Mu.RUnlock()
-	switch activeSocks5 {
-	case socks5RateLimitSwitch:
-		return len(socks5Proxies) + 1
-	case socks5RateLimitSwitchNoDirect:
-		if len(socks5Proxies) == 0 {
-			return 1
-		}
-		return len(socks5Proxies)
-	default:
-		return 1
+func modelProxyLabel(proxyAddr string) string {
+	if proxy, ok := configuredSocks5Proxy(proxyAddr); ok {
+		return socks5ProxyLabel(proxy)
 	}
+	return "direct"
 }
 
-func rotateSocks5OnRateLimit() {
-	socks5Mu.Lock()
-	defer socks5Mu.Unlock()
-	includeDirect := activeSocks5 == socks5RateLimitSwitch
-	if activeSocks5 != socks5RateLimitSwitch && activeSocks5 != socks5RateLimitSwitchNoDirect {
-		return
-	}
-	total := len(socks5Proxies)
-	if includeDirect {
-		total++
-	}
-	if total <= 1 {
-		if includeDirect {
-			log.Printf("[rate-limit proxy switch] upstream 429, only direct exit available")
-		} else {
-			log.Printf("[rate-limit proxy switch] upstream 429, no SOCKS5 exit available")
+func clearSocks5ClientCache() {
+	socks5ClientsMu.Lock()
+	defer socks5ClientsMu.Unlock()
+	for _, client := range socks5Clients {
+		if transport, ok := client.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
 		}
-		return
 	}
-	oldIdx := int(atomic.LoadUint32(&socks5RateLimitIndex)) % total
-	nextIdx := (oldIdx + 1) % total
-	atomic.StoreUint32(&socks5RateLimitIndex, uint32(nextIdx))
-	socks5Client = nil
-	socks5ClientAddr = ""
-	log.Printf("[rate-limit proxy switch] upstream 429: %s -> %s", socks5ExitLabelLocked(oldIdx, includeDirect), socks5ExitLabelLocked(nextIdx, includeDirect))
+	socks5Clients = map[socks5ClientKey]*http.Client{}
 }
 
 // ======================== 随机 ID ========================
@@ -773,7 +611,7 @@ func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, err
 				req.Header.Set("Authorization", "Bearer "+apiKey)
 			}
 		}
-		resp, err := getHTTPClient(false).Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1073,7 +911,6 @@ type AppConfig struct {
 
 	ReasoningEffortMap map[string]string          `json:"reasoning_effort_map"`
 	Socks5Proxies      []Socks5Proxy              `json:"socks5_proxies,omitempty"`
-	ActiveSocks5       string                     `json:"active_socks5,omitempty"`
 	Upstream           *UpstreamConfig            `json:"upstream,omitempty"`
 	Upstreams          map[string]*UpstreamConfig `json:"upstreams,omitempty"`
 	DefaultUpstream    string                     `json:"default_upstream,omitempty"`
@@ -1082,6 +919,7 @@ type AppConfig struct {
 type ModelAlias struct {
 	TargetModel   string `json:"target_model"`
 	Upstream      string `json:"upstream,omitempty"`
+	Socks5Proxy   string `json:"socks5_proxy,omitempty"`
 	WithReasoning bool   `json:"with_reasoning,omitempty"`
 }
 
@@ -1207,6 +1045,7 @@ func normalizeConfig(cfg *AppConfig) {
 		trimmedKey := strings.TrimSpace(key)
 		alias.TargetModel = strings.TrimSpace(alias.TargetModel)
 		alias.Upstream = strings.TrimSpace(alias.Upstream)
+		alias.Socks5Proxy = strings.TrimSpace(alias.Socks5Proxy)
 		if trimmedKey == "" {
 			delete(cfg.ModelAlias, key)
 			continue
@@ -1219,6 +1058,29 @@ func normalizeConfig(cfg *AppConfig) {
 
 	if cfg.ReasoningEffortMap == nil {
 		cfg.ReasoningEffortMap = map[string]string{}
+	}
+	normalizedProxies := make([]Socks5Proxy, 0, len(cfg.Socks5Proxies))
+	proxyAddresses := make(map[string]struct{}, len(cfg.Socks5Proxies))
+	for _, proxy := range cfg.Socks5Proxies {
+		proxy.Addr = strings.TrimSpace(proxy.Addr)
+		proxy.Name = strings.TrimSpace(proxy.Name)
+		if proxy.Addr == "" {
+			continue
+		}
+		if _, exists := proxyAddresses[proxy.Addr]; exists {
+			continue
+		}
+		proxyAddresses[proxy.Addr] = struct{}{}
+		normalizedProxies = append(normalizedProxies, proxy)
+	}
+	cfg.Socks5Proxies = normalizedProxies
+	for key, alias := range cfg.ModelAlias {
+		if alias.Socks5Proxy != "" {
+			if _, exists := proxyAddresses[alias.Socks5Proxy]; !exists {
+				alias.Socks5Proxy = ""
+				cfg.ModelAlias[key] = alias
+			}
+		}
 	}
 	if cfg.Upstreams == nil {
 		cfg.Upstreams = map[string]*UpstreamConfig{}
@@ -1298,21 +1160,11 @@ func applyConfig(cfg AppConfig) bool {
 	}
 
 	socks5Mu.Lock()
-	proxiesUpdated := false
 	if cfg.Socks5Proxies != nil {
 		socks5Proxies = cfg.Socks5Proxies
-		proxiesUpdated = true
-	}
-	if proxiesUpdated || activeSocks5 != cfg.ActiveSocks5 {
-		activeSocks5 = cfg.ActiveSocks5
-		socks5Client = nil
-		socks5ClientAddr = ""
-		socks5StreamClient = nil
-		socks5StreamClientAddr = ""
-		atomic.StoreUint32(&socks5RRIndex, 0)
-		atomic.StoreUint32(&socks5RateLimitIndex, 0)
 	}
 	socks5Mu.Unlock()
+	clearSocks5ClientCache()
 
 	return upstreamsChanged
 }
@@ -2442,28 +2294,33 @@ func convertRequest(req *OpenAIRequest, withReasoning bool) map[string]any {
 		converted["tool_choice"] = req.ToolChoice
 	}
 
-	// Only forward thinking/reasoning_effort when WithReasoning is enabled (DeepSeek upstream).
-	// Other upstreams (Xunfei/ModelArts/OpenAI) don't need these fields and may reject them.
-	if withReasoning {
-		if req.Thinking != nil {
-			converted["thinking"] = req.Thinking
-		} else if req.ExtraBody != nil {
-			if thinking, ok := req.ExtraBody["thinking"]; ok && thinking != nil {
-				converted["thinking"] = thinking
-			}
+	// thinking/reasoning_effort describe the current request and are independent
+	// from withReasoning, which only controls replaying historical reasoning_content.
+	if req.Thinking != nil {
+		converted["thinking"] = req.Thinking
+	} else if req.ExtraBody != nil {
+		if thinking, ok := req.ExtraBody["thinking"]; ok && thinking != nil {
+			converted["thinking"] = thinking
 		}
 	}
-	if withReasoning && req.ReasoningEffort != "" {
+	effort := req.ReasoningEffort
+	if effort == "" && req.ExtraBody != nil {
+		effort, _ = req.ExtraBody["reasoning_effort"].(string)
+	}
+	if effort != "" {
 		effortMap := getReasoningEffortMap()
-		if mapped, ok := effortMap[req.ReasoningEffort]; ok {
+		if mapped, ok := effortMap[effort]; ok {
 			converted["reasoning_effort"] = mapped
 		} else {
-			converted["reasoning_effort"] = req.ReasoningEffort
+			converted["reasoning_effort"] = effort
 		}
 	}
 
 	if req.ExtraBody != nil {
 		for k, v := range req.ExtraBody {
+			if k == "thinking" || k == "reasoning_effort" {
+				continue
+			}
 			if _, exists := converted[k]; !exists {
 				converted[k] = v
 			}
@@ -2964,21 +2821,21 @@ func getUpstreamModelsEndpoint(upstream *UpstreamConfig) string {
 // ttfbReadCloser wraps an io.ReadCloser and logs the time-to-first-byte
 // on the first Read call, then delegates all subsequent calls to the inner ReadCloser.
 type ttfbReadCloser struct {
-	inner     io.ReadCloser
-	once      sync.Once
-	start     time.Time
-	upstream  string
-	model     string
-	clientAPI string
-	keySlot   string
-	exitLabel string
+	inner      io.ReadCloser
+	once       sync.Once
+	start      time.Time
+	upstream   string
+	model      string
+	clientAPI  string
+	keySlot    string
+	proxyLabel string
 }
 
 func (r *ttfbReadCloser) Read(p []byte) (int, error) {
 	n, err := r.inner.Read(p)
 	r.once.Do(func() {
 		ttfb := time.Since(r.start)
-		log.Printf("[ttfb] api=%s upstream=%s model=%s key=%s exit=%s ttfb=%s", r.clientAPI, r.upstream, r.model, r.keySlot, r.exitLabel, ttfb.Round(time.Millisecond))
+		log.Printf("[ttfb] api=%s upstream=%s model=%s key=%s proxy=%s ttfb=%s", r.clientAPI, r.upstream, r.model, r.keySlot, r.proxyLabel, ttfb.Round(time.Millisecond))
 	})
 	return n, err
 }
@@ -3025,17 +2882,18 @@ func prepareOpenAIUpstreamBody(reqBody []byte, modelID string, upstream *Upstrea
 	return tryBody, nil
 }
 
-func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, rawResponse ...bool) ([]byte, int, http.Header, error) {
+func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, rawResponse ...bool) ([]byte, int, http.Header, error) {
 	if upstream == nil || upstream.BaseURL == "" {
 		return nil, 500, nil, fmt.Errorf("upstream not configured")
 	}
 
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream)
 	retryDelay := 1 * time.Second
+	proxyLabel := modelProxyLabel(proxyAddr)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[client disconnect] api=%s upstream=%s model=%s key=%s exit=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), currentSocks5ExitLabel())
+			log.Printf("[client disconnect] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 			return nil, 0, nil, ctx.Err()
 		default:
 		}
@@ -3056,8 +2914,9 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 			retryDelay = 1 * time.Second
 			continue
 		}
-		c := getHTTPClient(false)
-		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s exit=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), currentSocks5ExitLabel())
+		var c *http.Client
+		c, proxyLabel = getModelHTTPClient(proxyAddr, false)
+		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 		startTTFB := time.Now()
 		resp, err := c.Do(up)
 		if err != nil {
@@ -3078,7 +2937,7 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			ttfb := time.Since(startTTFB)
-			log.Printf("[ttfb] api=%s upstream=%s model=%s key=%s exit=%s ttfb=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), currentSocks5ExitLabel(), ttfb.Round(time.Millisecond))
+			log.Printf("[ttfb] api=%s upstream=%s model=%s key=%s proxy=%s ttfb=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, ttfb.Round(time.Millisecond))
 			b, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if readErr != nil {
@@ -3096,10 +2955,7 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if shouldRetryUpstreamStatus(resp.StatusCode) {
-			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s exit=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), currentSocks5ExitLabel(), resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
-			if resp.StatusCode == http.StatusTooManyRequests {
-				rotateSocks5OnRateLimit()
-			}
+			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
 			waitDelay := retryDelay
 			if len(apiKeys) > 1 {
 				apiKey, apiKeyIndex = rotateUpstreamAPIKey(apiKeys, apiKeyIndex)
@@ -3128,25 +2984,26 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 	}
 }
 
-func callUpstream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, rawResponse ...bool) ([]byte, int, http.Header, error) {
+func callUpstream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, rawResponse ...bool) ([]byte, int, http.Header, error) {
 	tryBody, err := prepareOpenAIUpstreamBody(reqBody, modelID, upstream)
 	if err != nil {
 		return nil, 500, nil, err
 	}
-	return callPreparedUpstream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream, rawResponse...)
+	return callPreparedUpstream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream, proxyAddr, rawResponse...)
 }
 
-func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig) (io.ReadCloser, int, http.Header, error) {
+func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string) (io.ReadCloser, int, http.Header, error) {
 	if upstream == nil || upstream.BaseURL == "" {
 		return nil, 500, nil, fmt.Errorf("upstream not configured")
 	}
 
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream)
 	retryDelay := 1 * time.Second
+	proxyLabel := modelProxyLabel(proxyAddr)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[client disconnect] api=%s upstream=%s model=%s key=%s exit=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), currentSocks5ExitLabel())
+			log.Printf("[client disconnect] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 			return nil, 0, nil, ctx.Err()
 		default:
 		}
@@ -3167,8 +3024,9 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 			retryDelay = 1 * time.Second
 			continue
 		}
-		c := getHTTPClient(true)
-		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s exit=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), currentSocks5ExitLabel())
+		var c *http.Client
+		c, proxyLabel = getModelHTTPClient(proxyAddr, true)
+		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 		startTTFB := time.Now()
 		resp, err := c.Do(up)
 		if err != nil {
@@ -3189,23 +3047,20 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			wrappedBody := &ttfbReadCloser{
-				inner:     resp.Body,
-				start:     startTTFB,
-				upstream:  effectiveUpstreamName(upstreamName),
-				model:     modelID,
-				clientAPI: clientAPI,
-				keySlot:   formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)),
-				exitLabel: currentSocks5ExitLabel(),
+				inner:      resp.Body,
+				start:      startTTFB,
+				upstream:   effectiveUpstreamName(upstreamName),
+				model:      modelID,
+				clientAPI:  clientAPI,
+				keySlot:    formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)),
+				proxyLabel: proxyLabel,
 			}
 			return wrappedBody, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if shouldRetryUpstreamStatus(resp.StatusCode) {
-			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s exit=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), currentSocks5ExitLabel(), resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
-			if resp.StatusCode == http.StatusTooManyRequests {
-				rotateSocks5OnRateLimit()
-			}
+			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
 			waitDelay := retryDelay
 			if len(apiKeys) > 1 {
 				apiKey, apiKeyIndex = rotateUpstreamAPIKey(apiKeys, apiKeyIndex)
@@ -3234,12 +3089,12 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 	}
 }
 
-func callUpstreamStream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig) (io.ReadCloser, int, http.Header, error) {
+func callUpstreamStream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string) (io.ReadCloser, int, http.Header, error) {
 	tryBody, err := prepareOpenAIUpstreamBody(reqBody, modelID, upstream)
 	if err != nil {
 		return nil, 500, nil, err
 	}
-	return callPreparedUpstreamStream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream)
+	return callPreparedUpstreamStream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream, proxyAddr)
 }
 
 func stripBillingHeaderText(s string) string {
@@ -3827,7 +3682,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&req, modelAliasInfo.WithReasoning)
 
 	if req.Stream {
-		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream)
+		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream, modelAliasInfo.Socks5Proxy)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -3918,7 +3773,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream)
+	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream, modelAliasInfo.Socks5Proxy)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -4440,7 +4295,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if anthropicReq.Stream {
-			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream)
+			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
 			if err != nil || status < 200 || status >= 300 {
 				errResp := map[string]any{
 					"type":  "error",
@@ -4470,7 +4325,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream, true)
+		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy, true)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -4547,7 +4402,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq, modelAliasInfo.WithReasoning)
 
 	if anthropicReq.Stream {
-		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream)
+		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
 		if err != nil || status < 200 || status >= 300 {
 			errResp := map[string]any{
 				"type":  "error",
@@ -4579,7 +4434,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream)
+	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -5822,7 +5677,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if respReq.Stream {
-			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream)
+			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy)
 			if err != nil || status < 200 || status >= 300 {
 				w.Header().Set("Content-Type", "application/json")
 				status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -5847,7 +5702,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream, true)
+		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy, true)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -5915,9 +5770,9 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if respReq.ParallelToolCalls != nil {
 		chatReq.ExtraBody = map[string]any{"parallel_tool_calls": *respReq.ParallelToolCalls}
 	}
-	// Only forward Responses API reasoning.effort when WithReasoning is enabled (DeepSeek upstream).
-	// Other upstreams (Xunfei/ModelArts/OpenAI) don't need this field and may reject it.
-	if modelAliasInfo.WithReasoning && respReq.Reasoning.Effort != "" {
+	// reasoning.effort describes the current request and is independent from
+	// WithReasoning, which only controls replaying historical reasoning_content.
+	if respReq.Reasoning.Effort != "" {
 		if respReq.Reasoning.Effort != "none" {
 			chatReq.ReasoningEffort = respReq.Reasoning.Effort
 		}
@@ -5939,7 +5794,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	// 不需要在这里手动转换，避免双重转换导致请求体丢失
 	// 流式响应需要特殊处理
 	if respReq.Stream {
-		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream)
+		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -5983,7 +5838,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream)
+	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -6789,7 +6644,6 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
-		cfg.ActiveSocks5 = activeSocks5
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		// 附带上游模型列表供管理面板下拉框使用
@@ -6804,7 +6658,6 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			"model_alias":                  cfg.ModelAlias,
 			"reasoning_effort_map":         cfg.ReasoningEffortMap,
 			"socks5_proxies":               cfg.Socks5Proxies,
-			"active_socks5":                cfg.ActiveSocks5,
 			"upstreams":                    cfg.Upstreams,
 			"default_upstream":             cfg.DefaultUpstream,
 			"available_models":             availableModels,
@@ -7069,17 +6922,66 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 #dailyTable thead+tbody tr:last-child td{font-weight:600;color:var(--text);background:var(--stats-total-bg);border-top:1px solid var(--border-light)}
 .stats-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px}
 .stats-header .btns{display:flex;gap:6px;align-items:center}
+.panel-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px}
+.panel-header h2{margin-bottom:0}
+.panel-header .btns{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.upstream-default{max-width:420px;margin-bottom:14px}
+.upstream-list{display:flex;flex-direction:column;gap:10px}
+.upstream-item{border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-2);overflow:hidden;transition:border-color .15s}
+.upstream-item:hover{border-color:var(--border-light)}
+.upstream-item summary{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;list-style:none;user-select:none}
+.upstream-item summary::-webkit-details-marker{display:none}
+.upstream-item summary::before{content:'›';font-size:19px;line-height:1;color:var(--text-ter);transition:transform .15s;flex-shrink:0}
+.upstream-item[open] summary::before{transform:rotate(90deg)}
+.upstream-item[open] summary{border-bottom:1px solid var(--border)}
+.upstream-summary-name{font-size:13px;font-weight:600;color:var(--text);min-width:110px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.upstream-type-badge,.upstream-default-badge{padding:2px 7px;border-radius:999px;font-size:10px;line-height:1.5;white-space:nowrap}
+.upstream-type-badge{background:var(--accent-dim);color:var(--accent)}
+.upstream-default-badge{background:var(--green-dim);color:var(--green)}
+.upstream-default-badge.is-hidden{display:none}
+.upstream-summary-url{min-width:0;flex:1;color:var(--text-ter);font-family:var(--mono);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.upstream-summary-meta{color:var(--text-ter);font-size:10.5px;white-space:nowrap}
+.upstream-body{padding:15px 14px 14px}
+.upstream-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.upstream-field{min-width:0}
+.upstream-field.full{grid-column:1/-1}
+.upstream-field label{display:block;font-size:10.5px;font-weight:500;color:var(--text-ter);margin-bottom:5px;letter-spacing:.35px;text-transform:uppercase}
+.upstream-field input,.upstream-field textarea,.upstream-field select{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:12.5px;font-family:var(--mono);background:var(--surface);color:var(--text);transition:border-color .15s,box-shadow .15s}
+.upstream-field textarea{min-height:92px;resize:vertical;line-height:1.45}
+.upstream-field input:focus,.upstream-field textarea:focus,.upstream-field select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
+.upstream-field .field-hint{margin-top:4px;color:var(--text-ter);font-size:10.5px}
+.upstream-item-actions{display:flex;justify-content:flex-end;margin-top:14px;padding-top:12px;border-top:1px solid var(--border)}
+.upstream-empty{padding:24px;text-align:center;color:var(--text-ter);font-size:12.5px;border:1px dashed var(--border);border-radius:var(--radius-sm);background:var(--surface-2)}
 #toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;color:#fff;opacity:0;transition:opacity .25s,transform .25s;z-index:999;transform:translateY(-8px);pointer-events:none;backdrop-filter:blur(8px)}
 #toast.success{background:rgba(61,214,140,.85)}
 #toast.error{background:rgba(240,96,96,.85)}
 #toast.show{opacity:1;transform:translateY(0)}
 .empty-hint{color:var(--text-ter);font-size:13px;padding:28px;text-align:center}
+.advanced-settings{margin-top:18px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-2);overflow:hidden;transition:border-color .15s}
+.advanced-settings:hover{border-color:var(--border-light)}
+.advanced-settings summary{display:flex;align-items:center;gap:9px;padding:11px 14px;cursor:pointer;list-style:none;color:var(--text-sec);font-size:12.5px;font-weight:600;user-select:none}
+.advanced-settings summary::-webkit-details-marker{display:none}
+.advanced-settings summary::before{content:'›';font-size:18px;line-height:1;color:var(--text-ter);transition:transform .15s}
+.advanced-settings[open] summary::before{transform:rotate(90deg)}
+.advanced-settings[open] summary{border-bottom:1px solid var(--border)}
+.advanced-summary-count{margin-left:auto;color:var(--text-ter);font-size:11px;font-weight:400}
+.advanced-content{padding:14px}
+.advanced-hint{font-size:11px;color:var(--text-ter);margin-bottom:10px}
+.effort-label-row,.effort-row{display:grid;grid-template-columns:minmax(120px,1fr) 28px minmax(120px,1fr) auto;gap:8px;align-items:center}
+.effort-label-row{padding:0 1px 5px;color:var(--text-ter);font-size:10.5px;letter-spacing:.3px;text-transform:uppercase}
+.effort-row{margin-bottom:8px}
+.effort-row input{width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;font-size:12.5px;font-family:var(--mono);background:var(--surface);color:var(--text);transition:border-color .15s,box-shadow .15s}
+.effort-row input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
+.effort-arrow{text-align:center;color:var(--text-ter);font-family:var(--mono)}
+.effort-row .btn{padding:6px 10px;font-size:11px}
+.effort-empty{padding:16px 8px;color:var(--text-ter);font-size:12px;text-align:center;border:1px dashed var(--border);border-radius:6px}
+.effort-actions{margin-top:10px}
 .think-row{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:12px;transition:border-color .15s}
 .think-row:hover{border-color:var(--border-light)}
 .think-row input[type="checkbox"]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
 .think-row label{font-size:13px;font-weight:500;cursor:pointer;margin:0;color:var(--text)}
 .think-row .hint{font-size:11px;color:var(--text-ter);margin:0 0 0 auto;white-space:nowrap}
-@media(max-width:700px){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}}
+@media(max-width:700px){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}.effort-label-row,.effort-row{grid-template-columns:minmax(90px,1fr) 22px minmax(90px,1fr) auto}.upstream-form-grid{grid-template-columns:1fr}.upstream-field.full{grid-column:auto}.upstream-summary-url{display:none}.upstream-summary-meta{margin-left:auto}.upstream-default{max-width:none}}
 .theme-toggle{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 12px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all .15s;color:var(--text-sec);flex-shrink:0;line-height:1}
 .theme-toggle:hover{border-color:var(--border-light);color:var(--text)}
 </style>
@@ -7114,49 +7016,38 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 </div>
 
+<div class="config-grid">
 <div class="card full-row">
-<div class="card">
+<div class="panel-header">
 <h2><span class="dot" style="background:var(--green)"></span>多上游配置</h2>
-<div style="margin-bottom:12px">
-<table class="tbl" id="upstreamTable">
-<thead><tr><th style="width:14%">名称</th><th style="width:28%">Base URL</th><th style="width:18%">API Key（每行一个）</th><th style="width:14%">接口类型</th><th style="width:18%">自定义模型</th><th style="width:8%"></th></tr></thead>
-<tbody></tbody>
-</table>
-</div>
-<div class="form-group">
-<label>默认上游</label>
-<select id="defaultUpstream" class="m-select" style="width:100%" onchange="defaultUpstream=this.value;collectAliases();renderAliasTable()"></select>
-</div>
-<div class="actions">
+<div class="btns">
 <button class="btn btn-primary" onclick="addUpstreamRow()">添加上游</button>
 <button class="btn btn-success" onclick="saveConfig('上游配置')">保存上游</button>
 </div>
 </div>
-
-
-<div class="config-grid">
-<div class="card">
-<h2><span class="dot" style="background:var(--orange)"></span>推理力度映射</h2>
-<div style="margin-bottom:12px">
-<table class="tbl" id="effortTable">
-<thead><tr><th style="width:35%">请求值</th><th style="width:42%">映射值</th><th style="width:23%"></th></tr></thead>
-<tbody></tbody>
-</table>
+<div class="form-group upstream-default">
+<label>默认上游</label>
+<select id="defaultUpstream" class="m-select" onchange="onDefaultUpstreamChange(this)"></select>
 </div>
-<div class="actions">
-<button class="btn btn-primary" onclick="addEffortRow()">添加映射</button>
-<button class="btn btn-success" onclick="saveConfig()">保存全部</button>
+<div class="upstream-list" id="upstreamList"></div>
 </div>
-</div>
-
-<div class="card">
+<div class="card full-row">
 <h2><span class="dot" style="background:var(--accent)"></span>模型映射</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="aliasTable">
-<thead><tr><th style="width:24%">别名（请求名）</th><th style="width:20%">上游</th><th style="width:28%">实际模型（上游名）</th><th style="width:16%">启用思维链</th><th style="width:12%"></th></tr></thead>
+<thead><tr><th style="width:17%">别名（请求名）</th><th style="width:14%">上游</th><th style="width:24%">实际模型（上游名）</th><th style="width:18%">代理出口</th><th style="width:19%">回传 reasoning_content</th><th style="width:8%"></th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
+<details class="advanced-settings" id="reasoningEffortDetails">
+<summary><span>高级设置 · 推理力度映射</span><span class="advanced-summary-count" id="effortSummary">未配置 · 原值透传</span></summary>
+<div class="advanced-content">
+<div class="advanced-hint">将客户端传入的 reasoning_effort 映射为上游支持的值；未配置的值保持原样。</div>
+<div class="effort-label-row"><span>请求值</span><span></span><span>上游值</span><span></span></div>
+<div id="effortList"></div>
+<div class="effort-actions"><button class="btn btn-primary" onclick="addEffortRow()">添加映射</button></div>
+</div>
+</details>
 <div class="actions">
 <button class="btn btn-primary" onclick="addAliasRow()">添加别名</button>
 <button class="btn btn-success" onclick="saveConfig()">保存全部</button>
@@ -7164,18 +7055,12 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 
 <div class="card full-row">
-<h2><span class="dot" style="background:var(--accent)"></span>SOCKS5 代理</h2>
+<h2><span class="dot" style="background:var(--accent)"></span>SOCKS5 代理配置</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="socks5Table">
 <thead><tr><th style="width:25%">名称</th><th style="width:28%">地址</th><th style="width:17%">用户名</th><th style="width:17%">密码</th><th style="width:13%"></th></tr></thead>
 <tbody></tbody>
 </table>
-</div>
-<div class="form-group">
-<label>启用代理</label>
-<select id="activeSocks5" class="m-select">
-<option value="">直连（不使用代理）</option>
-</select>
 </div>
 <div class="actions">
 <button class="btn btn-primary" onclick="addSocks5Row()">添加代理</button>
@@ -7190,42 +7075,55 @@ let aliasData={},effortData={},modelListByUpstream={},upstreamData={},defaultUps
 function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
-function apiTypeSelectHtml(selected){const v=selected||'openai';return '<select data-field="api_type" class="m-select"><option value="openai"'+(v==='openai'?' selected':'')+'>OpenAI</option><option value="anthropic"'+(v==='anthropic'?' selected':'')+'>Anthropic</option><option value="openai-responses"'+(v==='openai-responses'?' selected':'')+'>Responses</option></select>'}
+function apiTypeSelectHtml(selected){const v=selected||'openai';return '<select data-field="api_type" onchange="onUpstreamTypeChange(this)"><option value="openai"'+(v==='openai'?' selected':'')+'>OpenAI</option><option value="anthropic"'+(v==='anthropic'?' selected':'')+'>Anthropic</option><option value="openai-responses"'+(v==='openai-responses'?' selected':'')+'>Responses</option></select>'}
+function upstreamTypeLabel(value){if(value==='anthropic')return 'Anthropic';if(value==='openai-responses')return 'Responses';return 'OpenAI'}
+function nonEmptyLineCount(value){return String(value||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean).length}
+function customModelCount(value){return String(value||'').split(',').map(s=>s.trim()).filter(Boolean).length}
+function responsesReasoningFormatHtml(value){const legacy=['reasoning_effort','legacy','legacy_reasoning_effort'].includes(value);return '<select data-field="responses_reasoning_format"><option value=""'+(!legacy?' selected':'')+'>标准 reasoning.effort</option><option value="legacy_reasoning_effort"'+(legacy?' selected':'')+'>兼容 reasoning_effort</option></select>'}
+function upstreamCardHtml(name,up,expanded){up=up||{};const apiType=up.api_type||'openai';const baseURL=up.base_url||'';const apiKey=up.api_key||'';const customModels=(up.custom_models||[]).join(',');const keyCount=nonEmptyLineCount(apiKey);const modelCount=(up.custom_models||[]).length;const isDefault=!!name&&name===defaultUpstream;let h='<details class="upstream-item" data-original-name="'+esc(name||'')+'"'+(expanded?' open':'')+'>';h+='<summary><span class="upstream-summary-name">'+esc(name||'未命名上游')+'</span><span class="upstream-type-badge">'+upstreamTypeLabel(apiType)+'</span><span class="upstream-default-badge'+(isDefault?'':' is-hidden')+'">默认</span><span class="upstream-summary-url">'+esc(baseURL||'尚未配置 Base URL')+'</span><span class="upstream-summary-meta">'+keyCount+' Key · '+modelCount+' 模型</span></summary>';h+='<div class="upstream-body"><div class="upstream-form-grid">';h+='<div class="upstream-field"><label>名称</label><input value="'+esc(name||'')+'" data-field="name" placeholder="例如: main" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field"><label>接口类型</label>'+apiTypeSelectHtml(apiType)+'</div>';h+='<div class="upstream-field full"><label>Base URL</label><input value="'+esc(baseURL)+'" data-field="base_url" placeholder="https://example.com/v1" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field full"><label>API Key（每行一个）</label><textarea data-field="api_key" placeholder="每行填写一个 API Key" oninput="updateUpstreamCardSummary(this)">'+esc(apiKey)+'</textarea><div class="field-hint">支持填写多个 Key，请求时按顺序轮询。</div></div>';h+='<div class="upstream-field full"><label>自定义模型</label><input value="'+esc(customModels)+'" data-field="custom_models" placeholder="model-a, model-b" oninput="updateUpstreamCardSummary(this)"><div class="field-hint">多个模型使用英文逗号分隔；留空时从上游 /models 获取。</div></div>';h+='<div class="upstream-field full responses-format-field"'+(apiType==='openai-responses'?'':' style="display:none"')+'><label>Responses 推理参数格式</label>'+responsesReasoningFormatHtml(up.responses_reasoning_format||'')+'</div>';h+='</div><div class="upstream-item-actions"><button class="btn btn-danger" onclick="delUpstream(this)">删除此上游</button></div></div></details>';return h}
 function buildModelMap(list){const grouped={};(list||[]).forEach(m=>{const owner=(m&&m.owned_by?String(m.owned_by):'default').trim()||'default';const id=m&&m.id?String(m.id):'';if(!id)return;if(!grouped[owner])grouped[owner]=[];grouped[owner].push(id)});Object.keys(grouped).forEach(k=>{grouped[k]=Array.from(new Set(grouped[k])).sort()});return grouped}
-function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',with_reasoning:!!raw.with_reasoning}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',with_reasoning:false}}});aliasData=next}
+function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||'',with_reasoning:!!raw.with_reasoning}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:'',with_reasoning:false}}});aliasData=next}
 function normalizeUpstreamData(cfg){upstreamData=cfg.upstreams||{};defaultUpstream=(cfg.default_upstream||defaultUpstream||'').trim();if(!defaultUpstream||!upstreamData[defaultUpstream])defaultUpstream=Object.keys(upstreamData).sort()[0]||''}
 async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();aliasData=cfg.model_alias||{};normalizeAliasData();effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];normalizeUpstreamData(cfg);if(cfg.available_models_by_upstream&&Object.keys(cfg.available_models_by_upstream).length){modelListByUpstream={};Object.keys(cfg.available_models_by_upstream).forEach(k=>{modelListByUpstream[k]=(cfg.available_models_by_upstream[k]||[]).map(m=>typeof m==='string'?m:(m&&m.id?m.id:'')).filter(Boolean);modelListByUpstream[k]=Array.from(new Set(modelListByUpstream[k])).sort()})}else if(cfg.available_models&&cfg.available_models.length){modelListByUpstream=buildModelMap(cfg.available_models)}else{try{const mr=await fetch('/v1/models');const md=await mr.json();modelListByUpstream=buildModelMap(md.data||[])}catch(e){modelListByUpstream={}}}
-renderUpstreamTable();renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
-function renderUpstreamTable(){const tb=document.querySelector('#upstreamTable tbody');const ks=Object.keys(upstreamData).sort();if(!ks.length){tb.innerHTML='<tr><td colspan="6" class="empty-hint">暂无上游配置</td></tr>';renderDefaultUpstreamSelect();return}tb.innerHTML=ks.map(name=>{const up=upstreamData[name]||{};return '<tr><td><input value="'+esc(name)+'" data-field="name" placeholder="例如: main"></td><td><input value="'+esc(up.base_url||'')+'" data-field="base_url" placeholder="https://example.com/v1"></td><td><textarea data-field="api_key" placeholder="每行一个 key">'+esc(up.api_key||'')+'</textarea></td><td>'+apiTypeSelectHtml(up.api_type)+'</td><td><input value="'+esc((up.custom_models||[]).join(','))+'" data-field="custom_models" placeholder="gpt-4o-mini,gpt-4.1"></td><td><button class="btn btn-danger" onclick="delUpstream(this)">删除</button></td></tr>'}).join('');renderDefaultUpstreamSelect()}
-function addUpstreamRow(){collectUpstreams();const tb=document.querySelector('#upstreamTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" data-field="name" placeholder="例如: main"></td><td><input value="" data-field="base_url" placeholder="https://example.com/v1"></td><td><textarea data-field="api_key" placeholder="每行一个 key"></textarea></td><td>'+apiTypeSelectHtml('openai')+'</td><td><input value="" data-field="custom_models" placeholder="gpt-4o-mini,gpt-4.1"></td><td><button class="btn btn-danger" onclick="delUpstream(this)">删除</button></td></tr>')}
-function delUpstream(btn){collectAliases();const row=btn.closest('tr');const ni=row.querySelector('[data-field="name"]');if(ni&&ni.value&&upstreamData[ni.value.trim()])delete upstreamData[ni.value.trim()];row.remove();if(!Object.keys(upstreamData).length)document.querySelector('#upstreamTable tbody').innerHTML='<tr><td colspan="6" class="empty-hint">暂无上游配置</td></tr>';renderDefaultUpstreamSelect();renderAliasTable()}
-function collectUpstreams(){const r={};document.querySelectorAll('#upstreamTable tbody tr').forEach(tr=>{const name=(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(tr.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!name||!baseURL)return;const apiKey=(tr.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const apiType=(tr.querySelector('[data-field="api_type"]')||{}).value||'openai';const customRaw=(tr.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const up={base_url:baseURL,api_type:apiType};if(apiKey)up.api_key=apiKey;if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);r[name]=up});upstreamData=r;if(!upstreamData[defaultUpstream])defaultUpstream=Object.keys(upstreamData).sort()[0]||'';return r}
-function renderDefaultUpstreamSelect(){const sel=document.getElementById('defaultUpstream');const names=Object.keys(upstreamData).sort();const cur=(defaultUpstream||sel.value||'').trim();sel.innerHTML='<option value="">-- 选择默认上游 --</option>'+names.map(name=>'<option value="'+esc(name)+'"'+(cur===name?' selected':'')+'>'+esc(name)+'</option>').join('');if(cur&&upstreamData[cur])sel.value=cur;else if(defaultUpstream&&upstreamData[defaultUpstream])sel.value=defaultUpstream;else sel.value=names[0]||'';defaultUpstream=sel.value||''}
+renderUpstreamTable();renderAliasTable();renderEffortTable();renderSocks5Table();setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
+function renderUpstreamTable(){const list=document.getElementById('upstreamList');const names=Object.keys(upstreamData).sort();list.innerHTML=names.length?names.map(name=>upstreamCardHtml(name,upstreamData[name],false)).join(''):'<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';renderDefaultUpstreamSelect();updateUpstreamDefaultBadges()}
+function addUpstreamRow(){collectUpstreams();const list=document.getElementById('upstreamList');const empty=list.querySelector('.upstream-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',upstreamCardHtml('',{api_type:'openai'},true));const cards=list.querySelectorAll('.upstream-item');const input=cards.length?cards[cards.length-1].querySelector('[data-field="name"]'):null;if(input)input.focus()}
+function delUpstream(btn){collectAliases();const card=btn.closest('.upstream-item');if(card)card.remove();collectUpstreams();const list=document.getElementById('upstreamList');if(!list.querySelector('.upstream-item'))list.innerHTML='<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';renderDefaultUpstreamSelect();renderAliasTable()}
+function collectUpstreams(){const r={};let renamedDefault='';document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const original=(card.dataset.originalName||'').trim();const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(original&&original===defaultUpstream&&name&&name!==original)renamedDefault=name;if(!name||!baseURL)return;const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const reasoningFormat=(card.querySelector('[data-field="responses_reasoning_format"]')||{}).value||'';const up={base_url:baseURL,api_type:apiType};if(apiKey)up.api_key=apiKey;if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);if(apiType==='openai-responses'&&reasoningFormat)up.responses_reasoning_format=reasoningFormat;r[name]=up;card.dataset.originalName=name});upstreamData=r;if(renamedDefault)defaultUpstream=renamedDefault;if(!upstreamData[defaultUpstream])defaultUpstream=Object.keys(upstreamData).sort()[0]||'';updateUpstreamDefaultBadges();return r}
+function renderDefaultUpstreamSelect(){const sel=document.getElementById('defaultUpstream');const names=Object.keys(upstreamData).sort();const cur=(defaultUpstream||sel.value||'').trim();sel.innerHTML='<option value="">-- 选择默认上游 --</option>'+names.map(name=>'<option value="'+esc(name)+'"'+(cur===name?' selected':'')+'>'+esc(name)+'</option>').join('');if(cur&&upstreamData[cur])sel.value=cur;else if(defaultUpstream&&upstreamData[defaultUpstream])sel.value=defaultUpstream;else sel.value=names[0]||'';defaultUpstream=sel.value||'';updateUpstreamDefaultBadges()}
+function updateUpstreamDefaultBadges(){document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const badge=card.querySelector('.upstream-default-badge');if(badge)badge.classList.toggle('is-hidden',!name||name!==defaultUpstream)})}
+function updateUpstreamCardSummary(el){const card=el.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value||'';card.querySelector('.upstream-summary-name').textContent=name||'未命名上游';card.querySelector('.upstream-summary-url').textContent=baseURL||'尚未配置 Base URL';card.querySelector('.upstream-type-badge').textContent=upstreamTypeLabel(apiType);card.querySelector('.upstream-summary-meta').textContent=nonEmptyLineCount(apiKey)+' Key · '+customModelCount(customRaw)+' 模型';updateUpstreamDefaultBadges()}
+function onUpstreamTypeChange(sel){const card=sel.closest('.upstream-item');const field=card?card.querySelector('.responses-format-field'):null;if(field)field.style.display=sel.value==='openai-responses'?'':'none';updateUpstreamCardSummary(sel)}
+function syncUpstreamOptions(){collectAliases();collectUpstreams();renderDefaultUpstreamSelect();renderAliasTable()}
+function onDefaultUpstreamChange(sel){collectAliases();defaultUpstream=sel.value||'';updateUpstreamDefaultBadges();renderAliasTable()}
 function modelsForUpstream(name){const resolved=(name||defaultUpstream||'').trim();return modelListByUpstream[resolved]||[]}
 function upstreamSelectHtml(selected){const names=Object.keys(upstreamData).sort();let h='<select data-field="upstream" class="m-select" onchange="onAliasUpstreamChange(this)">';h+='<option value="">默认上游</option>';for(const name of names){h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
 function modelSelectHtml(selected,upstreamName){const models=modelsForUpstream(upstreamName);let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';let found=!selected;for(const m of models){if(selected===m)found=true;h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (自定义)</option>';h+='</select>';return h}
-function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:'',upstream:'',with_reasoning:false};return '<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+upstreamSelectHtml(entry.upstream||'')+'</td><td data-model-cell="1">'+modelSelectHtml(entry.target_model||'',entry.upstream||'')+'</td><td><input type="checkbox" data-field="with_reasoning"'+(entry.with_reasoning?' checked':'')+'></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>'}).join('')}
+function socks5SelectHtml(selected){let h='<select data-field="socks5_proxy" class="m-select"><option value="">直连</option>';let found=!selected;for(const p of socks5Data){if(!p||!p.addr)continue;const addr=String(p.addr).trim();if(!addr)continue;if(selected===addr)found=true;const label=p.name?String(p.name)+' ('+addr+')':addr;h+='<option value="'+esc(addr)+'"'+(selected===addr?' selected':'')+'>'+esc(label)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (已失效)</option>';h+='</select>';return h}
+function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="6" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:'',upstream:'',socks5_proxy:'',with_reasoning:false};return '<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+upstreamSelectHtml(entry.upstream||'')+'</td><td data-model-cell="1">'+modelSelectHtml(entry.target_model||'',entry.upstream||'')+'</td><td>'+socks5SelectHtml(entry.socks5_proxy||'')+'</td><td><input type="checkbox" data-field="with_reasoning" title="将历史 assistant 消息中的 reasoning_content 回传给上游"'+(entry.with_reasoning?' checked':'')+'></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>'}).join('')}
 function onAliasUpstreamChange(sel){const row=sel.closest('tr');const holder=row.querySelector('[data-model-cell]');const current=row.querySelector('[data-field="val"]');const currentVal=current?current.value.trim():'';holder.innerHTML=modelSelectHtml(currentVal,sel.value)}
-function addAliasRow(){collectUpstreams();const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+upstreamSelectHtml('')+'</td><td data-model-cell="1">'+modelSelectHtml('', '')+'</td><td><input type="checkbox" data-field="with_reasoning"></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
-function delAlias(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>'}
-function collectAliases(){const r={};document.querySelectorAll('#aliasTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),u=tr.querySelector('[data-field="upstream"]'),v=tr.querySelector('[data-field="val"]'),w=tr.querySelector('[data-field="with_reasoning"]');if(k&&k.value.trim()){const aliasKey=k.value.trim();let targetModel=v?v.value.trim():'';const upstreamName=u?u.value.trim():'';const withReasoning=w?w.checked:false;if(!targetModel&&(upstreamName||withReasoning))targetModel=aliasKey;if(targetModel||upstreamName||withReasoning){r[aliasKey]={target_model:targetModel,upstream:upstreamName,with_reasoning:withReasoning}}}});aliasData=r;return r}
+function addAliasRow(){collectUpstreams();collectSocks5();const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+upstreamSelectHtml('')+'</td><td data-model-cell="1">'+modelSelectHtml('', '')+'</td><td>'+socks5SelectHtml('')+'</td><td><input type="checkbox" data-field="with_reasoning" title="将历史 assistant 消息中的 reasoning_content 回传给上游"></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
+function delAlias(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="6" class="empty-hint">暂无别名配置</td></tr>'}
+function collectAliases(){const r={};document.querySelectorAll('#aliasTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),u=tr.querySelector('[data-field="upstream"]'),v=tr.querySelector('[data-field="val"]'),p=tr.querySelector('[data-field="socks5_proxy"]'),w=tr.querySelector('[data-field="with_reasoning"]');if(k&&k.value.trim()){const aliasKey=k.value.trim();let targetModel=v?v.value.trim():'';const upstreamName=u?u.value.trim():'';const socks5Proxy=p?p.value.trim():'';const withReasoning=w?w.checked:false;if(!targetModel&&(upstreamName||socks5Proxy||withReasoning))targetModel=aliasKey;if(targetModel||upstreamName||socks5Proxy||withReasoning){r[aliasKey]={target_model:targetModel,upstream:upstreamName,socks5_proxy:socks5Proxy,with_reasoning:withReasoning}}}});aliasData=r;return r}
 
 
 
 
 
 
-function renderEffortTable(){const tb=document.querySelector('#effortTable tbody');const ks=Object.keys(effortData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无映射配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td><input value="'+esc(effortData[k])+'" data-field="val"></td><td><button class="btn btn-danger" onclick="delEffort(this)">删除</button></td></tr>').join('')}
-function addEffortRow(){const tb=document.querySelector('#effortTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: low" data-field="key"></td><td><input value="" placeholder="例如: high" data-field="val"></td><td><button class="btn btn-danger" onclick="delEffort(this)">删除</button></td></tr>')}
-function delEffort(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&effortData[ki.value])delete effortData[ki.value];row.remove();if(!Object.keys(effortData).length)document.querySelector('#effortTable tbody').innerHTML='<tr><td colspan="3" class="empty-hint">暂无映射配置</td></tr>'}
-function collectEfforts(){const r={};document.querySelectorAll('#effortTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),v=tr.querySelector('[data-field="val"]');if(k&&k.value.trim())r[k.value.trim()]=v?v.value.trim():''});effortData=r;return r}
-function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="例如: 127.0.0.1:1080"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('');renderSocks5Select()}
-function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';socks5Data.push({addr:'',name:''});renderSocks5Table()}
-function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
+function effortRowHtml(key,val){return '<div class="effort-row"><input value="'+esc(key||'')+'" data-field="key" placeholder="例如: low"><span class="effort-arrow">→</span><input value="'+esc(val||'')+'" data-field="val" placeholder="例如: high"><button class="btn btn-danger" onclick="delEffort(this)">删除</button></div>'}
+function updateEffortSummary(){const el=document.getElementById('effortSummary');if(!el)return;const count=Object.keys(effortData||{}).length;el.textContent=count?count+' 条映射':'未配置 · 原值透传'}
+function renderEffortTable(){const list=document.getElementById('effortList');const ks=Object.keys(effortData);list.innerHTML=ks.length?ks.map(k=>effortRowHtml(k,effortData[k])).join(''):'<div class="effort-empty">未配置，reasoning_effort 将按原值透传</div>';updateEffortSummary()}
+function addEffortRow(){collectEfforts();const details=document.getElementById('reasoningEffortDetails');details.open=true;const list=document.getElementById('effortList');const empty=list.querySelector('.effort-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',effortRowHtml('',''));const rows=list.querySelectorAll('.effort-row');const input=rows.length?rows[rows.length-1].querySelector('[data-field="key"]'):null;if(input)input.focus()}
+function delEffort(btn){const row=btn.closest('.effort-row');if(row)row.remove();collectEfforts();renderEffortTable()}
+function collectEfforts(){const r={};document.querySelectorAll('#effortList .effort-row').forEach(row=>{const k=row.querySelector('[data-field="key"]'),v=row.querySelector('[data-field="val"]');if(k&&k.value.trim())r[k.value.trim()]=v?v.value.trim():''});effortData=r;updateEffortSummary();return r}
+function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name" onchange="syncSocks5AliasOptions()"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="例如: 127.0.0.1:1080" onchange="syncSocks5AliasOptions()"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('')}
+function addSocks5Row(){collectSocks5();socks5Data.push({addr:'',name:''});renderSocks5Table()}
+function delSocks5(i){collectAliases();const rows=document.querySelectorAll('#socks5Table tbody tr');if(rows[i])rows[i].remove();collectSocks5();renderSocks5Table();renderAliasTable()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
-function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=1){const opt=document.createElement('option');opt.value='__rate_limit_switch__';opt.textContent='限流切换（429 后切换，含直连）';sel.appendChild(opt);const opt2=document.createElement('option');opt2.value='__rate_limit_switch_no_direct__';opt2.textContent='限流切换（429 后切换，不含直连）';sel.appendChild(opt2)}if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（每次请求切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(section){collectUpstreams();defaultUpstream=(document.getElementById('defaultUpstream').value||defaultUpstream||'').trim();collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,upstreams:upstreamData,default_upstream:defaultUpstream||''};const label=section||'配置';try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast(label+'已保存','success');loadConfig()}catch(e){showToast(label+'保存失败: '+e.message,'error')}}
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function syncSocks5AliasOptions(){collectAliases();collectSocks5();renderAliasTable()}
+async function saveConfig(section){const selectedDefault=(document.getElementById('defaultUpstream').value||defaultUpstream||'').trim();if(selectedDefault)defaultUpstream=selectedDefault;collectAliases();collectUpstreams();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,upstreams:upstreamData,default_upstream:defaultUpstream||''};const label=section||'配置';try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast(label+'已保存','success');loadConfig()}catch(e){showToast(label+'保存失败: '+e.message,'error')}}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
 async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);const dm=d.daily?d.daily.models||{}:{};const dk=Object.keys(dm);let h='';if(d.daily&&d.daily.date){h+='<div style="margin-bottom:16px;padding:10px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:13px">📊 今日统计 ('+esc(d.daily.date)+')：请求 '+fmt(d.daily.total_requests)+' 次</div>'}if(dk.length>0){h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">今日模型用量</h3><table class="tbl" id="dailyTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';let dr=0,dp=0,dc=0,dt=0;for(const k of dk){const m=dm[k];if(!m)continue;h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';dr+=m.request_count;dp+=m.prompt_tokens;dc+=m.completion_tokens;dt+=m.total_tokens}h+='<tr style="font-weight:600"><td>今日合计</td><td>'+fmt(dr)+'</td><td>'+fmt(dp)+'</td><td>'+fmt(dc)+'</td><td>'+fmt(dt)+'</td></tr>';h+='</tbody></table><hr style="border:none;border-top:1px solid var(--border);margin:20px 0">'}h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">累计统计</h3><table class="tbl" id="statsTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600"><td>累计总计</td><td>'+fmt(tr)+'</td><td>'+fmt(pt)+'</td><td>'+fmt(ct)+'</td><td>'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
