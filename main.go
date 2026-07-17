@@ -2542,6 +2542,23 @@ func convertStreamChunkWithUsage(line string) (string, map[string]any) {
 
 	choices, ok := raw["choices"].([]any)
 	if !ok || len(choices) == 0 {
+		// choices 为空但有 usage 时，仍需转发给客户端
+		if usage != nil {
+			raw["choices"] = []any{}
+			delete(raw, "cost")
+			delete(raw, "service_tier")
+			delete(raw, "prompt_logprobs")
+			delete(raw, "prompt_token_ids")
+			delete(raw, "kv_transfer_params")
+			if v, ok := raw["usage"]; ok && v == nil {
+				delete(raw, "usage")
+			}
+			converted, err := json.Marshal(raw)
+			if err != nil {
+				return "", usage
+			}
+			return "data: " + string(converted), usage
+		}
 		return "", usage
 	}
 	for i, c := range choices {
