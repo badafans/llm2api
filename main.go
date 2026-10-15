@@ -5382,6 +5382,12 @@ func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser,
 	created := time.Now().Unix()
 	roleSent := false
 	toolCallAccumulator := map[int]map[string]string{}
+	// toolCallOrder 记录上游 content block 索引的出现顺序；
+	// toolCallOutIndex 把「上游全局 block 索引」映射到「发给客户端的连续 tool_calls index」。
+	// 必须分开：上游的 block index 是全局的（thinking/text 块也占号，例如
+	// thinking=0、tool_use=1），而 OpenAI 的 tool_calls[].index 必须从 0 连续递增。
+	var toolCallOrder []int
+	toolCallOutIndex := map[int]int{}
 	fullUsage := map[string]any{}
 
 	defer func() {
@@ -5476,10 +5482,21 @@ func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser,
 				blockType, _ := block["type"].(string)
 				switch blockType {
 				case "tool_use":
-					idx := len(toolCallAccumulator)
+					// 用上游全局 block index 做累加键，避免 thinking/text 块占号导致错位；
+					// 另建 outIndex 映射，保证发给客户端的 index 仍从 0 连续。
+					upstreamIdx := 0
+					if v, ok := event["index"].(float64); ok {
+						upstreamIdx = int(v)
+					}
+					outIndex, exists := toolCallOutIndex[upstreamIdx]
+					if !exists {
+						outIndex = len(toolCallOrder)
+						toolCallOutIndex[upstreamIdx] = outIndex
+						toolCallOrder = append(toolCallOrder, upstreamIdx)
+					}
 					callID, _ := block["id"].(string)
 					name, _ := block["name"].(string)
-					toolCallAccumulator[idx] = map[string]string{
+					toolCallAccumulator[upstreamIdx] = map[string]string{
 						"id":   callID,
 						"name": name,
 						"args": "",
@@ -5491,7 +5508,7 @@ func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser,
 					delta := map[string]any{
 						"tool_calls": []map[string]any{
 							{
-								"index": float64(idx),
+								"index": float64(outIndex),
 								"id":    callID,
 								"type":  "function",
 								"function": map[string]any{
@@ -5533,18 +5550,20 @@ func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser,
 			case "input_json_delta":
 				partialJSON, _ := deltaObj["partial_json"].(string)
 				index, _ := event["index"].(float64)
-				idx := int(index)
-				if tc, ok := toolCallAccumulator[idx]; ok {
+				upstreamIdx := int(index)
+				if tc, ok := toolCallAccumulator[upstreamIdx]; ok {
 					tc["args"] += partialJSON
-					delta := map[string]any{
-						"tool_calls": []map[string]any{
-							{
-								"index":    float64(idx),
-								"function": map[string]any{"arguments": partialJSON},
+					if partialJSON != "" {
+						delta := map[string]any{
+							"tool_calls": []map[string]any{
+								{
+									"index":    float64(toolCallOutIndex[upstreamIdx]),
+									"function": map[string]any{"arguments": partialJSON},
+								},
 							},
-						},
+						}
+						emitChatChunk(delta, nil, nil)
 					}
-					emitChatChunk(delta, nil, nil)
 				}
 			}
 
