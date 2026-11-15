@@ -1,3 +1,5 @@
+
+
 # LLM Gateway
 
 一个支持多上游、多协议转换的 LLM 代理网关。将上游的 OpenAI / Anthropic / Responses API 统一转换为 OpenAI Chat 格式对外提供，同时支持 Anthropic Messages 和 OpenAI Responses 协议的透传与转换。客户端只用配置的"别名"发请求，网关按别名路由到对应上游、做协议互转、转发并记录 Token 用量。
@@ -33,7 +35,7 @@ go run main.go -port 8080 -password mypass
 2. 在"自定义模型"字段：手工填写，或点"获取模型列表"按钮，后端会实时调用上游 `/models` 拉取并自动填入
 3. 保存上游配置
 4. "模型映射" → 添加别名（请求名）→ 选上游 → 选实际模型（该上游的 custom_models 列表）→ 可选代理/回传 reasoning_content
-5. 保存后，客户端用这个别名词请求 `/v1/*` 即可
+5. 保存后，客户端用这个别名请求 `/v1/*` 即可
 
 ## 命令行参数
 
