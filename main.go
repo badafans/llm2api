@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,7 +15,9 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/textproto"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -194,26 +197,48 @@ func socks5Dial(proxy Socks5Proxy) func(context.Context, string, string) (net.Co
 	}
 }
 
-func configuredSocks5Proxy(addr string) (Socks5Proxy, bool) {
-	addr = strings.TrimSpace(addr)
-	if addr == "" {
+// socks5ProxyRef is the identifier aliases use to reference a proxy. Several proxies may share one
+// address and differ only by username (e.g. one local SOCKS5 port that picks the exit by account),
+// so the ref is "username@addr", or just the addr when there is no username (the legacy format).
+func socks5ProxyRef(proxy Socks5Proxy) string {
+	if proxy.Username != "" {
+		return proxy.Username + "@" + proxy.Addr
+	}
+	return proxy.Addr
+}
+
+// findSocks5Proxy resolves a ref against list: exact ref first, then a legacy addr-only ref (first
+// proxy with that address), then a proxy name.
+func findSocks5Proxy(list []Socks5Proxy, ref string) (Socks5Proxy, bool) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
 		return Socks5Proxy{}, false
 	}
-	socks5Mu.RLock()
-	defer socks5Mu.RUnlock()
-	for _, proxy := range socks5Proxies {
-		if proxy.Addr == addr {
-			return proxy, true
+	for _, match := range []func(Socks5Proxy) bool{
+		func(p Socks5Proxy) bool { return socks5ProxyRef(p) == ref },
+		func(p Socks5Proxy) bool { return p.Addr == ref },
+		func(p Socks5Proxy) bool { return p.Name != "" && p.Name == ref },
+	} {
+		for _, p := range list {
+			if match(p) {
+				return p, true
+			}
 		}
 	}
 	return Socks5Proxy{}, false
 }
 
+func configuredSocks5Proxy(ref string) (Socks5Proxy, bool) {
+	socks5Mu.RLock()
+	defer socks5Mu.RUnlock()
+	return findSocks5Proxy(socks5Proxies, ref)
+}
+
 func socks5ProxyLabel(proxy Socks5Proxy) string {
 	if proxy.Name != "" {
-		return proxy.Name + " (" + proxy.Addr + ")"
+		return proxy.Name + " (" + socks5ProxyRef(proxy) + ")"
 	}
-	return proxy.Addr
+	return socks5ProxyRef(proxy)
 }
 
 func getModelHTTPClient(proxyAddr string, stream bool) (*http.Client, string) {
@@ -838,9 +863,10 @@ type DailyStats struct {
 }
 
 type TokenStatsData struct {
-	TotalRequests int64                  `json:"total_requests"`
-	Models        map[string]*ModelStats `json:"models"`
+	TotalRequests int64                  `json:"total_requests,omitempty"` // 旧版累计，不再更新
+	Models        map[string]*ModelStats `json:"models,omitempty"`         // 旧版累计，不再更新
 	Daily         *DailyStats            `json:"daily,omitempty"`
+	History       []DailyStats           `json:"history,omitempty"` // 最近 29 天（不含今日），新→旧排列
 }
 
 var (
@@ -890,12 +916,17 @@ type FunctionCall struct {
 type Tool struct {
 	Type     string       `json:"type"`
 	Function ToolFunction `json:"function"`
+	// CacheControl 是 Anthropic prompt caching 的断点标记，客户端可能挂在
+	// tool 层或 function 层（见 convertOpenAIToolsToAnthropic 的两种读取路径）。
+	// 必须显式声明，否则序列化时会丢掉 —— 缺了它缓存永远不命中。
+	CacheControl any `json:"cache_control,omitempty"`
 }
 
 type ToolFunction struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	Parameters   map[string]any `json:"parameters"`
+	CacheControl any            `json:"cache_control,omitempty"`
 }
 
 type UpstreamType string
@@ -912,6 +943,12 @@ type UpstreamConfig struct {
 	APIType                  UpstreamType `json:"api_type"`
 	CustomModels             []string     `json:"custom_models,omitempty"`
 	ResponsesReasoningFormat string       `json:"responses_reasoning_format,omitempty"`
+	// DisableAnthropicAutoCache 关闭「Anthropic 上游自动 prompt caching」。
+	// 默认关闭(false)即启用自动缓存：请求顶层注入 cache_control，
+	// 由上游自动把断点放到最后一个可缓存块并随对话前移。
+	// 之所以默认开启：下游客户端（Cherry Studio / WorkBuddy 等）说的是
+	// OpenAI 协议，不会打 cache_control 断点，不注入则命中率恒为 0。
+	DisableAnthropicAutoCache bool `json:"disable_anthropic_auto_cache,omitempty"`
 }
 
 type AppConfig struct {
@@ -926,16 +963,6 @@ type ModelAlias struct {
 	TargetModel string `json:"target_model"`
 	Upstream    string `json:"upstream,omitempty"`
 	Socks5Proxy string `json:"socks5_proxy,omitempty"`
-	// MultimodalModel 是可选的多模态模型：当请求本轮携带图片时，
-	// 路由切换到该模型（如 mimo）；纯文本仍走 TargetModel。
-	// 留空则不启用多模态路由（图片原样发给 TargetModel）。
-	MultimodalModel string `json:"multimodal_model,omitempty"`
-	// MultimodalUpstream 多模态模型可独立指定上游（与 TargetModel 不同上游）。
-	// 留空则复用 Upstream。
-	MultimodalUpstream string `json:"multimodal_upstream,omitempty"`
-	// MultimodalSocks5Proxy 多模态模型的独立代理出口。
-	// 留空则复用 Socks5Proxy。
-	MultimodalSocks5Proxy string `json:"multimodal_socks5_proxy,omitempty"`
 }
 
 // ======================== Anthropic Messages API 类型 ========================
@@ -1019,12 +1046,13 @@ type ResponsesAPIRequest struct {
 }
 
 type ResponsesTool struct {
-	Type        string          `json:"type"`
-	Name        string          `json:"name,omitempty"`
-	Description string          `json:"description,omitempty"`
-	Parameters  map[string]any  `json:"parameters,omitempty"`
-	Function    *ToolFunction   `json:"function,omitempty"`
-	Tools       []ResponsesTool `json:"tools,omitempty"`
+	Type         string          `json:"type"`
+	Name         string          `json:"name,omitempty"`
+	Description  string          `json:"description,omitempty"`
+	Parameters   map[string]any  `json:"parameters,omitempty"`
+	Function     *ToolFunction   `json:"function,omitempty"`
+	Tools        []ResponsesTool `json:"tools,omitempty"`
+	CacheControl any             `json:"cache_control,omitempty"`
 }
 
 type ResponseToolNameMapping struct {
@@ -1061,9 +1089,6 @@ func normalizeConfig(cfg *AppConfig) {
 		alias.TargetModel = strings.TrimSpace(alias.TargetModel)
 		alias.Upstream = strings.TrimSpace(alias.Upstream)
 		alias.Socks5Proxy = strings.TrimSpace(alias.Socks5Proxy)
-		alias.MultimodalModel = strings.TrimSpace(alias.MultimodalModel)
-		alias.MultimodalUpstream = strings.TrimSpace(alias.MultimodalUpstream)
-		alias.MultimodalSocks5Proxy = strings.TrimSpace(alias.MultimodalSocks5Proxy)
 		if trimmedKey == "" {
 			delete(cfg.ModelAlias, key)
 			continue
@@ -1077,21 +1102,32 @@ func normalizeConfig(cfg *AppConfig) {
 	if cfg.ReasoningEffortMap == nil {
 		cfg.ReasoningEffortMap = map[string]string{}
 	}
+	// Proxies are keyed by socks5ProxyRef, so entries sharing an address but using different
+	// usernames are all kept. adminConfigHandler rejects blank or duplicate rows before this runs.
 	normalizedProxies := make([]Socks5Proxy, 0, len(cfg.Socks5Proxies))
-	proxyAddresses := make(map[string]struct{}, len(cfg.Socks5Proxies))
+	proxyRefs := make(map[string]struct{}, len(cfg.Socks5Proxies))
 	for _, proxy := range cfg.Socks5Proxies {
 		proxy.Addr = strings.TrimSpace(proxy.Addr)
 		proxy.Name = strings.TrimSpace(proxy.Name)
+		proxy.Username = strings.TrimSpace(proxy.Username)
 		if proxy.Addr == "" {
 			continue
 		}
-		if _, exists := proxyAddresses[proxy.Addr]; exists {
+		if _, exists := proxyRefs[socks5ProxyRef(proxy)]; exists {
 			continue
 		}
-		proxyAddresses[proxy.Addr] = struct{}{}
+		proxyRefs[socks5ProxyRef(proxy)] = struct{}{}
 		normalizedProxies = append(normalizedProxies, proxy)
 	}
 	cfg.Socks5Proxies = normalizedProxies
+	// Rewrite legacy addr-only / name references to the canonical ref so they keep pointing at the
+	// same proxy once more proxies share that address. Unknown refs stay for the orphan check.
+	for key, alias := range cfg.ModelAlias {
+		if p, ok := findSocks5Proxy(cfg.Socks5Proxies, alias.Socks5Proxy); ok {
+			alias.Socks5Proxy = socks5ProxyRef(p)
+		}
+		cfg.ModelAlias[key] = alias
+	}
 	// 不静默清空 alias.Socks5Proxy：保留引用，交由 adminConfigHandler POST 阶段
 	// 校验"孤儿代理引用"并返回 400，避免用户不知情地丢失配置。
 	if cfg.Upstreams == nil {
@@ -1178,49 +1214,12 @@ func resolveModel(model string) (string, ModelAlias, string, *UpstreamConfig) {
 	return m, alias, upstreamName, upstream
 }
 
-// resolveEffectiveModel 根据是否多模态路由，返回最终使用的模型名、上游名、上游配置与代理 addr。
-// 多模态时若配置了独立的 multimodal_upstream / multimodal_socks5_proxy 则切换对应上游与代理；
-// 否则复用主上游与主代理。返回的 proxy 是代理 addr（若配置的是 name 则解析为 addr）。
-func resolveEffectiveModel(alias ModelAlias, baseModel string, baseUpstreamName string, baseUpstream *UpstreamConfig, useMultimodal bool) (string, string, *UpstreamConfig, string) {
-	if !useMultimodal {
-		return baseModel, baseUpstreamName, baseUpstream, alias.Socks5Proxy
-	}
-	mmModel := alias.MultimodalModel
-	if mmModel == "" {
-		return baseModel, baseUpstreamName, baseUpstream, alias.Socks5Proxy
-	}
-	mmUpstreamName := strings.TrimSpace(alias.MultimodalUpstream)
-	// 多模态代理：name → addr 解析；空则直连（不复用主代理），与 UI"直连"文案一致
-	mmProxy := resolveProxyAddr(alias.MultimodalSocks5Proxy)
-	if mmUpstreamName == "" {
-		// 复用主上游
-		return mmModel, baseUpstreamName, baseUpstream, mmProxy
-	}
-	// 切换到一个独立的多模态上游
-	upName, upCfg := resolveUpstream(mmUpstreamName)
-	if upCfg == nil {
-		// 多模态上游未配置，回退主上游
-		return mmModel, baseUpstreamName, baseUpstream, mmProxy
-	}
-	return mmModel, upName, upCfg, mmProxy
-}
-
 // resolveProxyAddr 将代理名（name）解析为 addr；若传入的已是 addr 则原样返回。
 // socks5 配置里 name 与 addr 都可能被引用，这里统一处理。
 func resolveProxyAddr(proxyRef string) string {
 	ref := strings.TrimSpace(proxyRef)
-	if ref == "" {
-		return ""
-	}
-	configMu.RLock()
-	defer configMu.RUnlock()
-	for _, p := range socks5Proxies {
-		if p.Addr == ref {
-			return p.Addr
-		}
-		if p.Name == ref {
-			return p.Addr
-		}
+	if p, ok := configuredSocks5Proxy(ref); ok {
+		return socks5ProxyRef(p)
 	}
 	return ref
 }
@@ -1254,14 +1253,26 @@ func checkAndResetDailyStats() {
 	if statsDate == "" {
 		statsDate = today
 		if tokenStats.Daily == nil || tokenStats.Daily.Date != today {
+			archiveDailyLocked()
 			tokenStats.Daily = &DailyStats{Date: today, Models: map[string]*ModelStats{}}
 		}
 		return
 	}
 	if statsDate != today {
-		log.Printf("[统计] 日期变更 %s -> %s，重置每日统计", statsDate, today)
+		log.Printf("[统计] 日期变更 %s -> %s，归档昨日统计并重置", statsDate, today)
+		archiveDailyLocked()
 		statsDate = today
 		tokenStats.Daily = &DailyStats{Date: today, Models: map[string]*ModelStats{}}
+	}
+}
+
+// archiveDailyLocked 把当前 Daily 推入 History 并裁剪到 29 天。调用方必须持有 tokenStatsMu。
+func archiveDailyLocked() {
+	if tokenStats.Daily != nil && tokenStats.Daily.Date != "" && tokenStats.Daily.TotalRequests > 0 {
+		tokenStats.History = append([]DailyStats{*tokenStats.Daily}, tokenStats.History...)
+		if len(tokenStats.History) > 29 {
+			tokenStats.History = tokenStats.History[:29]
+		}
 	}
 }
 
@@ -1305,16 +1316,6 @@ func saveTokenStats() {
 func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens int64) {
 	checkAndResetDailyStats()
 	tokenStatsMu.Lock()
-	tokenStats.TotalRequests++
-	ms, ok := tokenStats.Models[model]
-	if !ok {
-		ms = &ModelStats{}
-		tokenStats.Models[model] = ms
-	}
-	ms.RequestCount++
-	ms.PromptTokens += promptTokens
-	ms.CompletionTokens += completionTokens
-	ms.TotalTokens += totalTokens
 	if tokenStats.Daily == nil {
 		tokenStats.Daily = &DailyStats{Date: getToday(), Models: map[string]*ModelStats{}}
 	}
@@ -1330,6 +1331,29 @@ func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens 
 	dms.TotalTokens += totalTokens
 	tokenStatsMu.Unlock()
 	go saveTokenStats()
+}
+
+// recordUsageFromMap 从 usage map 中提取 token 计数并记录统计。
+// 自动检测 Anthropic 格式（input_tokens）与 OpenAI 格式（prompt_tokens）。
+func recordUsageFromMap(model string, usage map[string]any) {
+	if usage == nil {
+		return
+	}
+	var pt, ct float64
+	if _, isAnthropic := usage["input_tokens"]; isAnthropic {
+		inputTokens, _ := getFloat(usage, "input_tokens")
+		cc, _ := getFloat(usage, "cache_creation_input_tokens")
+		cr, _ := getFloat(usage, "cache_read_input_tokens")
+		ct, _ = getFloat(usage, "output_tokens")
+		pt = inputTokens + cc + cr
+	} else {
+		pt, _ = getFloat(usage, "prompt_tokens")
+		ct, _ = getFloat(usage, "completion_tokens")
+	}
+	tt := pt + ct
+	if tt > 0 {
+		recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
+	}
 }
 
 // ======================== Thinking/Reasoning 判断 ========================
@@ -1497,8 +1521,15 @@ func buildAnthropicThinking(req map[string]any) any {
 	return nil
 }
 
-// openAIToAnthropicRequest 将 OpenAI Chat 请求转为 Anthropic Messages 格式
+// openAIToAnthropicRequest 将 OpenAI Chat 请求转为 Anthropic Messages 格式。
+// autoCache 为 true 时注入顶层 cache_control 启用 Anthropic 自动 prompt caching
+// （断点由上游自动放在最后一个可缓存块，并随对话增长前移）。
 func openAIToAnthropicRequest(body []byte) []byte {
+	return openAIToAnthropicRequestEx(body, false)
+}
+
+// openAIToAnthropicRequestEx 是 openAIToAnthropicRequest 的扩展版，可控制自动缓存注入。
+func openAIToAnthropicRequestEx(body []byte, autoCache bool) []byte {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		return body
@@ -1507,8 +1538,21 @@ func openAIToAnthropicRequest(body []byte) []byte {
 	model, _ := req["model"].(string)
 	msgs, _ := req["messages"].([]any)
 
-	var systemTexts []string
+	// system 在 OpenAI 里是 messages 里的一个 role，在 Anthropic 里是顶层字段。
+	// 上游是 Anthropic 时 system 必须提升到顶层，且要保留 cache_control 断点
+	// （Anthropic 的 prompt caching 只在显式断点处生效，剥掉就永远不命中）。
+	var systemBlocks []map[string]any
 	var anthropicMsgs []map[string]any
+
+	// anthropicTextBlock 构造 text block，透传 cache_control（若客户端带了）。
+	anthropicTextBlock := func(text string, src map[string]any) map[string]any {
+		block := map[string]any{"type": "text", "text": text}
+		if cc, ok := src["cache_control"]; ok && cc != nil {
+			block["cache_control"] = cc
+		}
+		return block
+	}
+
 	handleContent := func(content any, role string) []map[string]any {
 		var blocks []map[string]any
 		switch c := content.(type) {
@@ -1522,7 +1566,7 @@ func openAIToAnthropicRequest(body []byte) []byte {
 					switch p["type"] {
 					case "text":
 						if t, ok := p["text"].(string); ok && t != "" {
-							blocks = append(blocks, map[string]any{"type": "text", "text": t})
+							blocks = append(blocks, anthropicTextBlock(t, p))
 						}
 					case "image_url":
 						blocks = append(blocks, convertOpenAIImageToAnthropic(p))
@@ -1531,6 +1575,25 @@ func openAIToAnthropicRequest(body []byte) []byte {
 			}
 		}
 		return blocks
+	}
+
+	// Anthropic 协议要求：assistant 消息中所有 tool_use 的 tool_result，
+	// 必须全部出现在紧接着的下一条消息里。OpenAI 协议的并行工具调用会产生
+	// 多条连续的 role=tool 消息，若逐个转成独立 user 消息，上游会拒收：
+	//   messages.N: `tool_use` ids were found without `tool_result` blocks
+	//   immediately after: toolu_xxx
+	// 因此把连续的 tool 消息合并进同一条 user 消息（Anthropic 允许一条消息
+	// 携带多个 tool_result 块）。
+	var pendingToolResults []map[string]any
+	flushToolResults := func() {
+		if len(pendingToolResults) == 0 {
+			return
+		}
+		anthropicMsgs = append(anthropicMsgs, map[string]any{
+			"role":    "user",
+			"content": pendingToolResults,
+		})
+		pendingToolResults = nil
 	}
 
 	for _, m := range msgs {
@@ -1542,13 +1605,20 @@ func openAIToAnthropicRequest(body []byte) []byte {
 		content := msg["content"]
 
 		if role == "system" {
-			if s, ok := content.(string); ok {
-				systemTexts = append(systemTexts, s)
+			// 两种形态都要接：字符串（常见）与 block 数组（带 cache_control 的客户端）。
+			// 原实现只处理字符串，数组形态被静默丢弃 —— 整个 system 消息消失。
+			for _, blk := range handleContent(content, role) {
+				if bt, _ := blk["type"].(string); bt == "text" {
+					systemBlocks = append(systemBlocks, blk)
+				}
 			}
 			continue
 		}
 
+		// 注意：flush 必须放在 tool 分支之后 —— 若放在这里，每条 tool 消息
+		// 到达时都会先把上一条冲出去，导致连续的 tool_result 仍被拆成多条消息。
 		if role == "assistant" {
+			flushToolResults()
 			var blocks []map[string]any
 
 			if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
@@ -1603,16 +1673,17 @@ func openAIToAnthropicRequest(body []byte) []byte {
 				b, _ := json.Marshal(content)
 				resultText = string(b)
 			}
-			anthropicMsgs = append(anthropicMsgs, map[string]any{
-				"role": "user",
-				"content": []map[string]any{
-					{"type": "tool_result", "tool_use_id": toolCallID, "content": resultText},
-				},
+			// 攒着不立即发出：连续的多个 tool 消息最终会合并成同一条
+			// user 消息，满足 Anthropic「所有 tool_result 必须在紧邻的
+			// 下一条消息中」的约束。
+			pendingToolResults = append(pendingToolResults, map[string]any{
+				"type": "tool_result", "tool_use_id": toolCallID, "content": resultText,
 			})
 			continue
 		}
 
 		if role == "user" {
+			flushToolResults()
 			blocks := handleContent(content, role)
 			if len(blocks) == 0 {
 				continue
@@ -1621,17 +1692,23 @@ func openAIToAnthropicRequest(body []byte) []byte {
 		}
 	}
 
+	flushToolResults()
+
 	if len(anthropicMsgs) == 0 {
 		return body
 	}
-
 	anthropicReq := map[string]any{
 		"model":      model,
 		"messages":   anthropicMsgs,
 		"max_tokens": 4096,
 	}
-	if len(systemTexts) > 0 {
-		anthropicReq["system"] = strings.Join(systemTexts, "\n")
+	// system：统一发数组块形态。
+	// ① 断点是块级属性，只有数组形态能承载 cache_control；
+	// ② 实测部分 Anthropic 中转上游对字符串形态的 system 处理有缺陷
+	//    （长文本被整个忽略，input_tokens 只剩几十），数组形态才可靠。
+	// Anthropic 官方 Messages API 两种形态都接受，数组形态是更通用的写法。
+	if len(systemBlocks) > 0 {
+		anthropicReq["system"] = systemBlocks
 	}
 	if stream, _ := req["stream"].(bool); stream {
 		anthropicReq["stream"] = true
@@ -1683,8 +1760,148 @@ func openAIToAnthropicRequest(body []byte) []byte {
 		anthropicReq["thinking"] = t
 	}
 
+	// Anthropic 自动 prompt caching：顶层注入 cache_control 后，上游自动把断点
+	// 放在「最后一个可缓存块」（本场景即 system 末尾）并随对话增长前移。
+	// 实测（WorkBuddy 真实请求 46K system + 24 tools）：启用后首轮写入 61924 tokens，
+	// 后续请求全部命中 cache_read=61924，首包延迟从 41s 降到 10s；不注入则恒为 0。
+	// 若客户端已自带断点（任一层级），则不再注入，避免占用 4 个断点槽位。
+	if autoCache && !anthropicReqHasCacheControl(anthropicReq) {
+		injectAnthropicCacheBreakpoint(anthropicReq)
+	}
+
 	result, _ := json.Marshal(anthropicReq)
 	return result
+}
+
+// anthropicReqHasCacheControl 检查请求里是否已有任何层级的 cache_control 断点
+// （顶层 / system 块 / tools / messages 块）。已有则说明客户端自己在管缓存，
+// 网关不再注入，避免抢占 4 个断点槽位或改写客户端刻意安排的布局。
+// 兼容两种数据形态：转换路径产出的 []map[string]any，与直通路径从任意 JSON
+// 反序列化出的 []any / string。
+func anthropicReqHasCacheControl(req map[string]any) bool {
+	if _, ok := req["cache_control"]; ok { // 旧版顶层注入或异常字段
+		return true
+	}
+	if blocksHaveCacheControl(req["system"]) {
+		return true
+	}
+	if blocksHaveCacheControl(req["tools"]) {
+		return true
+	}
+	switch msgs := req["messages"].(type) {
+	case []map[string]any:
+		for _, m := range msgs {
+			if blocksHaveCacheControl(m["content"]) {
+				return true
+			}
+		}
+	case []any:
+		for _, mm := range msgs {
+			if m, ok := mm.(map[string]any); ok && blocksHaveCacheControl(m["content"]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// blocksHaveCacheControl 判断一个 block 列表（system / tools / message.content）里
+// 是否有任一块带 cache_control。非数组形态（如 string content）返回 false。
+func blocksHaveCacheControl(blocks any) bool {
+	switch b := blocks.(type) {
+	case []map[string]any:
+		for _, blk := range b {
+			if cc, ok := blk["cache_control"]; ok && cc != nil {
+				return true
+			}
+		}
+	case []any:
+		for _, it := range b {
+			if blk, ok := it.(map[string]any); ok {
+				if cc, ok := blk["cache_control"]; ok && cc != nil {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// injectAnthropicCacheBreakpoint 按 Anthropic 官方推荐布局注入「块级」cache_control
+// 断点。Anthropic prompt caching 只认块级断点（挂在 system / tools / messages 的 block
+// 上），缓存覆盖「从头到该断点」的整段前缀；顶层 cache_control 字段不是合法字段，会被
+// 官方 API 及多数透传中转直接丢弃，命中率恒为 0（这正是旧实现无法命中缓存的原因）。
+//
+// prompt 前缀顺序为 tools → system → messages，上限 4 个断点。本函数最多打 3 个：
+//   ① tools 末尾  —— 工具定义独立成一段缓存；system 偶尔带时间戳等变化时，tools 仍命中；
+//   ② system 末尾 —— 覆盖 tools+system 整段最大静态前缀（最大收益点）；
+//   ③ 最后一条 message 末尾 —— 把当前轮的完整历史写入缓存，下一轮按前缀增量命中，
+//      多轮对话每轮几乎全量 cache_read。
+// 仅在请求尚无任何断点时调用（见 anthropicReqHasCacheControl），不与客户端自管缓存冲突。
+func injectAnthropicCacheBreakpoint(req map[string]any) {
+	// ③ 对话末尾：最后一条 message 的最后一个 content block。
+	switch msgs := req["messages"].(type) {
+	case []map[string]any:
+		if len(msgs) > 0 {
+			setCacheControlOnLastBlock(ensureMessageContentBlocks(msgs[len(msgs)-1]))
+		}
+	case []any:
+		if len(msgs) > 0 {
+			if last, ok := msgs[len(msgs)-1].(map[string]any); ok {
+				setCacheControlOnLastBlock(ensureMessageContentBlocks(last))
+			}
+		}
+	}
+
+	// ② system 末尾（string 形态先提升为单块数组才能承载块级断点）。
+	switch sys := req["system"].(type) {
+	case string:
+		if strings.TrimSpace(sys) != "" {
+			req["system"] = []map[string]any{{
+				"type": "text", "text": sys,
+				"cache_control": map[string]any{"type": "ephemeral"},
+			}}
+		}
+	default:
+		setCacheControlOnLastBlock(sys)
+	}
+
+	// ① tools 末尾。
+	setCacheControlOnLastBlock(req["tools"])
+}
+
+// setCacheControlOnLastBlock 给 block 列表的最后一个块对象挂 cache_control 断点。
+// 兼容 []map[string]any 与 []any 两种形态；非数组或空列表时不做任何事。
+func setCacheControlOnLastBlock(blocks any) {
+	switch b := blocks.(type) {
+	case []map[string]any:
+		if len(b) > 0 {
+			b[len(b)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
+		}
+	case []any:
+		for i := len(b) - 1; i >= 0; i-- {
+			if m, ok := b[i].(map[string]any); ok {
+				m["cache_control"] = map[string]any{"type": "ephemeral"}
+				return
+			}
+		}
+	}
+}
+
+// ensureMessageContentBlocks 返回可挂断点的 content block 列表。若 content 是纯字符串
+// （直通路径常见），就地提升为单个 text block 数组并写回 msg；空字符串返回 nil。
+func ensureMessageContentBlocks(msg map[string]any) any {
+	switch c := msg["content"].(type) {
+	case string:
+		if strings.TrimSpace(c) == "" {
+			return nil
+		}
+		blocks := []map[string]any{{"type": "text", "text": c}}
+		msg["content"] = blocks
+		return blocks
+	default:
+		return c
+	}
 }
 
 func convertOpenAIImageToAnthropic(part map[string]any) map[string]any {
@@ -1719,6 +1936,9 @@ func convertOpenAIImageToAnthropic(part map[string]any) map[string]any {
 	}
 }
 
+// convertOpenAIToolsToAnthropic 把 OpenAI tools 转成 Anthropic tools。
+// cache_control 断点透传：工具定义常是 prompt 里最大的一块静态前缀，
+// Anthropic 官方就推荐把断点打在最后一个 tool 上；剥掉断点等于关掉缓存。
 func convertOpenAIToolsToAnthropic(tools []any) []map[string]any {
 	var result []map[string]any
 	for _, t := range tools {
@@ -1736,9 +1956,16 @@ func convertOpenAIToolsToAnthropic(tools []any) []map[string]any {
 		if params == nil {
 			params = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
-		result = append(result, map[string]any{
+		converted := map[string]any{
 			"name": name, "description": desc, "input_schema": params,
-		})
+		}
+		// 断点可能挂在 tool 层（OpenAI 风格扩展）或 function 层
+		if cc, ok := tc["cache_control"]; ok && cc != nil {
+			converted["cache_control"] = cc
+		} else if cc, ok := fn["cache_control"]; ok && cc != nil {
+			converted["cache_control"] = cc
+		}
+		result = append(result, converted)
 	}
 	return result
 }
@@ -2313,23 +2540,24 @@ func convertMessagesForUpstream(messages []Message) []map[string]any {
 			// 兼容严格要求 content 全为 block 数组的上游（如 zen/serde）：
 			// ① 字符串 content → text block 数组（OpenAI 上游也接受，无副作用）
 			// ② content 数组内若有裸字符串元素（混合结构残留）→ 包成 text block
+			// 注意：带 cache_control 的 content 必须保持数组形态 —— 断点是块级属性，
+			// 展开成字符串或重建 block 时丢掉它，Anthropic 上游就永远不会命中 prompt cache。
 			if msg.Role != "tool" {
 				if s, ok := content.(string); ok {
 					content = []any{map[string]any{"type": "text", "text": s}}
 				} else if arr, ok := content.([]any); ok {
-					for _, p := range arr {
-						if _, ok := p.(string); ok {
-							normalized := make([]any, 0, len(arr))
-							for _, item := range arr {
-								if s, ok := item.(string); ok {
-									normalized = append(normalized, map[string]any{"type": "text", "text": s})
-								} else {
-									normalized = append(normalized, item)
-								}
-							}
-							content = normalized
-							break
+					normalized := make([]any, 0, len(arr))
+					changed := false
+					for _, item := range arr {
+						if s, ok := item.(string); ok {
+							normalized = append(normalized, map[string]any{"type": "text", "text": s})
+							changed = true
+							continue
 						}
+						normalized = append(normalized, item)
+					}
+					if changed {
+						content = normalized
 					}
 				}
 			}
@@ -2529,12 +2757,112 @@ func parseAnthropicSSE(body []byte) (map[string]any, string, string, []map[strin
 					anthropicMsg["usage"] = usage
 				}
 			}
+			// stop_details（拒答类别与解释）与 delta 同级，不在 delta 内部；
+			// 要抬到顶层，否则 buildOpenAIResponse 拼不出拒答说明。
+			if anthropicMsg != nil {
+				if sd, ok := event["stop_details"]; ok && sd != nil {
+					anthropicMsg["stop_details"] = sd
+				}
+			}
 		case "message_stop":
 		case "error":
 			return nil, "", "", nil
 		}
 	}
 	return anthropicMsg, textBuilder.String(), thinkingBuilder.String(), toolUseBlocks
+}
+
+// anthropicUsageToOpenAI 把 Anthropic 口径的 usage 换算成 OpenAI 口径。
+//
+// Anthropic 把输入 token 拆成三段记账：input_tokens（未命中缓存的输入）、
+// cache_creation_input_tokens（写入缓存的部分）、cache_read_input_tokens（命中缓存的部分）。
+// 只取 input_tokens 会把带 prompt cache 的请求严重低估（缓存生效时它常常只剩个位数）。
+// OpenAI 口径下 prompt_tokens 是三段之和，命中缓存的部分另放
+// prompt_tokens_details.cached_tokens；completion_tokens 对应 output_tokens。
+func anthropicUsageToOpenAI(usage map[string]any) map[string]any {
+	if usage == nil {
+		return nil
+	}
+	inputTokens, _ := getFloat(usage, "input_tokens")
+	cacheCreation, _ := getFloat(usage, "cache_creation_input_tokens")
+	cacheRead, _ := getFloat(usage, "cache_read_input_tokens")
+	outputTokens, _ := getFloat(usage, "output_tokens")
+
+	promptTokens := int64(inputTokens + cacheCreation + cacheRead)
+	completionTokens := int64(outputTokens)
+	return map[string]any{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + completionTokens,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": int64(cacheRead),
+		},
+	}
+}
+
+// refusalNoticeText 从 Anthropic 的 message_delta 事件里提取拒答信息，拼成可读文本。
+//
+// 上游结构（HTTP 200 的正常响应，不是错误）：
+//
+//	"delta": {"stop_reason": "refusal"},
+//	"stop_details": {"type": "refusal", "category": "cyber", "explanation": "..."}
+//
+// stop_details 也可能挂在 delta 对象内部，两处都找。取不到就返回空串，
+// 由调用方决定是否跳过（此时客户端只能看到空内容 + refusal 终止原因）。
+func refusalNoticeText(event map[string]any) string {
+	details, _ := event["stop_details"].(map[string]any)
+	if details == nil {
+		if deltaObj, ok := event["delta"].(map[string]any); ok {
+			details, _ = deltaObj["stop_details"].(map[string]any)
+		}
+	}
+	if details == nil {
+		return ""
+	}
+	category, _ := details["category"].(string)
+	explanation, _ := details["explanation"].(string)
+	if category == "" && explanation == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("[upstream refused this request]")
+	if category != "" {
+		b.WriteString(" category=")
+		b.WriteString(category)
+	}
+	if explanation != "" {
+		b.WriteString("\n")
+		b.WriteString(explanation)
+	}
+	return b.String()
+}
+
+// anthropicStopReasonToFinishReason 把 Anthropic 的 stop_reason 映射为 OpenAI 的 finish_reason。
+//
+// Anthropic 的完整枚举：end_turn / max_tokens / stop_sequence / tool_use / pause_turn / refusal。
+// refusal 是「模型按安全策略拒答」，属于 HTTP 200 的正常终态（不是网络/服务错误）。
+// 这里**原样保留 refusal**，不映射成 content_filter —— 后者在 OpenAI 语义里指
+// 「输出被内容过滤器拦截」，与 Anthropic 的模型主动拒答是两回事，混用会让调用方
+// 误解拒答发生的环节（过滤 vs 模型决策）。
+// 已实测：下游 responses 流式处理器按「非空 finish_reason 即终态」处理，能正确识别 refusal。
+func anthropicStopReasonToFinishReason(stopReason string) string {
+	switch stopReason {
+	case "tool_use":
+		return "tool_calls"
+	case "end_turn":
+		return "stop"
+	case "max_tokens":
+		return "length"
+	case "stop_sequence":
+		return "stop"
+	case "pause_turn":
+		// pause_turn 是服务端工具循环的中途暂停，语义上等同本轮正常结束
+		return "stop"
+	case "refusal":
+		return "refusal"
+	default:
+		return stopReason
+	}
 }
 
 func buildOpenAIResponse(anthropicMsg map[string]any, text string, reasoning string, toolUseBlocks []map[string]any, modelID string) []byte {
@@ -2547,12 +2875,13 @@ func buildOpenAIResponse(anthropicMsg map[string]any, text string, reasoning str
 		role = "assistant"
 	}
 	finishReason, _ := anthropicMsg["stop_reason"].(string)
-	if finishReason == "tool_use" {
-		finishReason = "tool_calls"
-	} else if finishReason == "end_turn" {
-		finishReason = "stop"
-	} else if finishReason == "max_tokens" {
-		finishReason = "length"
+	finishReason = anthropicStopReasonToFinishReason(finishReason)
+	// 拒答时上游 content 为空，只给 finish_reason 客户端会显示一片空白。
+	// Anthropic 把原因放在顶层 stop_details（category/explanation），合成可读文本。
+	if finishReason == "refusal" && text == "" {
+		if notice := refusalNoticeText(anthropicMsg); notice != "" {
+			text = notice
+		}
 	}
 	message := map[string]any{"role": role, "content": text}
 	if reasoning != "" {
@@ -2590,21 +2919,9 @@ func buildOpenAIResponse(anthropicMsg map[string]any, text string, reasoning str
 		"choices": []map[string]any{choice},
 	}
 	if usage, ok := anthropicMsg["usage"].(map[string]any); ok {
-		openAIUsage := map[string]any{}
-		if v, ok := usage["input_tokens"]; ok {
-			openAIUsage["prompt_tokens"] = v
+		if openAIUsage := anthropicUsageToOpenAI(usage); openAIUsage != nil {
+			resp["usage"] = openAIUsage
 		}
-		if v, ok := usage["output_tokens"]; ok {
-			openAIUsage["completion_tokens"] = v
-		}
-		if pt, ok1 := openAIUsage["prompt_tokens"]; ok1 {
-			if ct, ok2 := openAIUsage["completion_tokens"]; ok2 {
-				ptF, _ := pt.(float64)
-				ctF, _ := ct.(float64)
-				openAIUsage["total_tokens"] = int64(ptF + ctF)
-			}
-		}
-		resp["usage"] = openAIUsage
 	}
 	result, _ := json.Marshal(resp)
 	return result
@@ -2838,6 +3155,14 @@ func convertResponse(data []byte) ([]byte, error) {
 		if v, ok := usage["total_tokens"]; ok && v != nil {
 			cleanU["total_tokens"] = v
 		}
+		// 缓存命中明细：Anthropic 上游转过来时由 anthropicUsageToOpenAI 生成，
+		// 客户端（如 Cherry Studio）据此显示缓存命中率，不能在这一步丢掉。
+		if v, ok := usage["prompt_tokens_details"]; ok && v != nil {
+			cleanU["prompt_tokens_details"] = v
+		}
+		if v, ok := usage["completion_tokens_details"]; ok && v != nil {
+			cleanU["completion_tokens_details"] = v
+		}
 		if len(cleanU) > 0 {
 			raw["usage"] = cleanU
 		} else {
@@ -2995,7 +3320,8 @@ func prepareOpenAIUpstreamBody(reqBody []byte, modelID string, upstream *Upstrea
 	if upstream != nil {
 		switch upstream.APIType {
 		case UpstreamAnthropic:
-			tryBody = openAIToAnthropicRequest(marshaled)
+			// 默认启用自动 prompt caching（客户端打不了断点，网关代劳）
+			tryBody = openAIToAnthropicRequestEx(marshaled, !upstream.DisableAnthropicAutoCache)
 		case UpstreamResponses:
 			tryBody = openAIToResponsesRequest(marshaled, upstream)
 		}
@@ -3072,6 +3398,10 @@ func callPreparedUpstreamEF(ctx context.Context, preparedBody []byte, upstreamNa
 		c, proxyLabel = getModelHTTPClient(proxyAddr, false)
 		log.Printf("[upstream request] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, ip, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 		startTTFB := time.Now()
+		// 绑定客户端 ctx：客户端断开/取消时 Go transport 会立即关闭上游连接。
+		// 不绑定的话流式请求（streamHTTPClient.Timeout=0）会永久挂住，
+		// 每个挂住的请求都泄漏一个 goroutine、一条 TCP 连接和读缓冲区。
+		up = up.WithContext(ctx)
 		resp, err := c.Do(up)
 		if err != nil {
 			if err := waitForRetry(ctx, retryDelay); err != nil {
@@ -3339,6 +3669,10 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 		c, proxyLabel = getModelHTTPClient(proxyAddr, true)
 		log.Printf("[upstream request] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, ip, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 		startTTFB := time.Now()
+		// 绑定客户端 ctx：客户端断开/取消时 Go transport 会立即关闭上游连接。
+		// 不绑定的话流式请求（streamHTTPClient.Timeout=0）会永久挂住，
+		// 每个挂住的请求都泄漏一个 goroutine、一条 TCP 连接和读缓冲区。
+		up = up.WithContext(ctx)
 		resp, err := c.Do(up)
 		if err != nil {
 			if err := waitForRetry(ctx, retryDelay); err != nil {
@@ -3464,7 +3798,7 @@ func ensureResponsesIncludeUsage(req map[string]any) {
 	req["stream_options"] = map[string]any{"include_usage": true}
 }
 
-func prepareAnthropicPassthroughBody(body []byte, modelID string) ([]byte, error) {
+func prepareAnthropicPassthroughBody(body []byte, modelID string, autoCache bool) ([]byte, error) {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, err
@@ -3472,6 +3806,12 @@ func prepareAnthropicPassthroughBody(body []byte, modelID string) ([]byte, error
 	req["model"] = modelID
 	if err := normalizeRawMessagesToolCallArguments(req["messages"]); err != nil {
 		return nil, err
+	}
+	// 原生 Claude 入口直通 Anthropic 上游：Claude Code 这类客户端自带断点，
+	// anthropicReqHasCacheControl 命中后原样透传、一字不改；裸客户端（不打断点）
+	// 则由网关补齐块级断点，和转换路径享受同样的 prompt caching。
+	if autoCache && !anthropicReqHasCacheControl(req) {
+		injectAnthropicCacheBreakpoint(req)
 	}
 	return json.Marshal(req)
 }
@@ -3635,15 +3975,7 @@ func extractResponsesUsage(payload map[string]any) map[string]any {
 }
 
 func recordUsageMap(model string, u map[string]any) {
-	pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
-	ct, _ := getFloat(u, "completion_tokens", "output_tokens")
-	tt, _ := getFloat(u, "total_tokens")
-	if tt == 0 && pt+ct > 0 {
-		tt = pt + ct
-	}
-	if tt > 0 {
-		recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
-	}
+	recordUsageFromMap(model, u)
 }
 
 func responsesUsageToChatUsage(u map[string]any) map[string]any {
@@ -3878,6 +4210,87 @@ func normalizeUpstreamStatus(status int) int {
 	return status
 }
 
+// ======================== 请求体大小限制 ========================
+
+const (
+	// maxJSONRequestBodyBytes 是 chat / messages / responses 等 JSON 接口的请求体上限。
+	maxJSONRequestBodyBytes int64 = 10 * 1024 * 1024
+	// maxMultipartRequestBodyBytes 图片编辑含 base64 文件，单独放宽。
+	maxMultipartRequestBodyBytes int64 = 30 * 1024 * 1024
+)
+
+// requestBodyTooLargeError 表示请求体超过上限。
+// 单独定义类型，是为了让调用方判定后回 413 而不是笼统的 400。
+type requestBodyTooLargeError struct {
+	Limit  int64
+	Actual int64 // Content-Length 或实际读到的字节数；未知为 0
+}
+
+func (e *requestBodyTooLargeError) Error() string {
+	size := formatByteSize(e.Limit)
+	if e.Actual > 0 {
+		return fmt.Sprintf("request body too large: %d bytes exceeds the %d-byte limit (%s)",
+			e.Actual, e.Limit, size)
+	}
+	return fmt.Sprintf("request body too large: exceeds the %d-byte limit (%s)", e.Limit, size)
+}
+
+// readRequestBody 读取请求体，超限时返回 *requestBodyTooLargeError。
+//
+// 原实现是 io.ReadAll(io.LimitReader(r.Body, limit))：超过上限的部分被静默丢弃，
+// 得到半截 JSON，后续 Unmarshal 失败，客户端只看到 "Invalid JSON" —— 完全不知道
+// 是体积超限、超了多少、上限是多少。这里多读 1 字节来判定超限，并带回具体数字。
+func readRequestBody(r *http.Request, limit int64) ([]byte, error) {
+	// Content-Length 已知且已超限：直接拒绝，不把几十 MB 读进内存
+	if r.ContentLength > limit {
+		return nil, &requestBodyTooLargeError{Limit: limit, Actual: r.ContentLength}
+	}
+	// 多读 1 字节：chunked 请求没有 Content-Length，只能靠实际读取判定
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, &requestBodyTooLargeError{Limit: limit, Actual: int64(len(body))}
+	}
+	return body, nil
+}
+
+// writeRequestBodyTooLarge 以 OpenAI 兼容结构返回 413，
+// 字段风格与上游错误一致（message/type/code/details），下游同一套逻辑就能读。
+func writeRequestBodyTooLarge(w http.ResponseWriter, e *requestBodyTooLargeError) {
+	// 请求体没读完，连接状态不可靠，明确让客户端重开连接
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusRequestEntityTooLarge)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": e.Error(),
+			"type":    "invalid_request_error",
+			"code":    "request_too_large",
+			"details": map[string]any{
+				"type":   "request_body_too_large",
+				"limit":  e.Limit,
+				"actual": e.Actual,
+			},
+		},
+	})
+}
+
+// formatByteSize 把字节数转成人读形式（如 10.0 MB）。
+func formatByteSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
 func applyUpstreamErrorHeaders(w http.ResponseWriter, upstreamHeaders http.Header, status int) int {
 	status = normalizeUpstreamStatus(status)
 	copyFilteredResponseHeaders(w.Header(), upstreamHeaders)
@@ -3930,27 +4343,89 @@ func mapUpstreamErrorBody(body []byte, upstreamType UpstreamType) []byte {
 			return b
 		}
 	}
-	// Top-level message
+	// Top-level message（NVIDIA NIM / vLLM 等扁平结构：{message,type,code,details}）
 	if msg, ok := parsed["message"].(string); ok {
-		b, _ := json.Marshal(map[string]any{
-			"error": map[string]any{
-				"message": msg,
-				"type":    parsed["type"],
-				"code":    parsed["type"],
-			},
-		})
+		errObj := map[string]any{"message": msg}
+		if t, ok := parsed["type"]; ok && t != nil {
+			errObj["type"] = t
+		}
+		// 保留上游原始 code（通常是有意义的数字，如 400），不要拿 type 字符串顶替
+		if c, ok := parsed["code"]; ok && c != nil {
+			errObj["code"] = c
+		}
+		// details 必须原样保留：NVIDIA NIM 把上下文超限的具体数据放在这里
+		//   {"type":"context_length","limit":262144,"actual":455289}
+		// 丢掉它下游只能看到笼统的 "Invalid request"，完全不知道是超了上下文、
+		// 更不知道上限和实际用量 —— 这正是「上游超上下文但下游不知道」的根因。
+		if d, ok := parsed["details"]; ok && d != nil {
+			errObj["details"] = d
+			errObj["message"] = enrichUpstreamErrorMessage(msg, d)
+		}
+		b, _ := json.Marshal(map[string]any{"error": errObj})
 		return b
 	}
 	// msg field
 	if msg, ok := parsed["msg"].(string); ok {
-		b, _ := json.Marshal(map[string]any{
-			"error": map[string]any{
-				"message": msg,
-			},
-		})
+		errObj := map[string]any{"message": msg}
+		if d, ok := parsed["details"]; ok && d != nil {
+			errObj["details"] = d
+			errObj["message"] = enrichUpstreamErrorMessage(msg, d)
+		}
+		b, _ := json.Marshal(map[string]any{"error": errObj})
 		return b
 	}
 	return trimmed
+}
+
+// enrichUpstreamErrorMessage 把结构化 details 里的关键数字拼进 message。
+//
+// 背景：NVIDIA NIM 等上游在请求超出上下文窗口时只回一句 "Invalid request"，
+// 真正的原因（context_length / limit / actual）藏在 details 里。下游客户端
+// 通常只展示 error.message，不解析 details，所以必须把数字写进 message，
+// 否则用户看到的就是「不知道哪里错了」。
+func enrichUpstreamErrorMessage(msg string, details any) string {
+	d, ok := details.(map[string]any)
+	if !ok {
+		return msg
+	}
+	kind, _ := d["type"].(string)
+	switch kind {
+	case "context_length":
+		limit, hasLimit := toFloat64OK(d["limit"])
+		actual, hasActual := toFloat64OK(d["actual"])
+		switch {
+		case hasLimit && hasActual:
+			return fmt.Sprintf("%s: context length exceeded (limit=%d, actual=%d tokens)",
+				msg, int64(limit), int64(actual))
+		case hasLimit:
+			return fmt.Sprintf("%s: context length exceeded (limit=%d tokens)", msg, int64(limit))
+		case hasActual:
+			return fmt.Sprintf("%s: context length exceeded (actual=%d tokens)", msg, int64(actual))
+		}
+	default:
+		if kind != "" {
+			return fmt.Sprintf("%s (%s)", msg, kind)
+		}
+	}
+	return msg
+}
+
+// toFloat64OK 是带 ok 返回的数值取值，避免把缺失字段误当成 0。
+func toFloat64OK(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	}
+	return 0, false
 }
 
 // ======================== Chat Completions Handler ========================
@@ -3964,8 +4439,12 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	body, err := readRequestBody(r, maxJSONRequestBodyBytes)
 	if err != nil {
+		if tooLarge, ok := err.(*requestBodyTooLargeError); ok {
+			writeRequestBodyTooLarge(w, tooLarge)
+			return
+		}
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -3989,23 +4468,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if req.Model == "" {
 		http.Error(w, `{"error":"model is required"}`, http.StatusBadRequest)
 		return
-	}
-
-	// 多模态路由：只按"本轮新增图片"判定（历史图片不锁定多模态路由）。
-	// 配置了 multimodal_model 且本轮带图 → 切换到多模态模型与对应上游/代理；
-	// 否则保持 target_model。路由到纯文本模型时剥离所有历史图片。
-	if modelAliasInfo.MultimodalModel != "" {
-		var useMM bool
-		if hasNewImageContent(req.Messages) {
-			useMM = true
-		} else {
-			req.Messages = stripImagesForTextModel(req.Messages)
-		}
-		modelName, upName, up, proxy := resolveEffectiveModel(modelAliasInfo, req.Model, upstreamName, upstream, useMM)
-		req.Model = modelName
-		upstreamName = upName
-		upstream = up
-		modelAliasInfo.Socks5Proxy = proxy
 	}
 
 	req.Messages = fixToolCallGaps(req.Messages)
@@ -4100,15 +4562,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		// 流结束后按最后一次 usage（上游通常为整轮累积值）记一次统计
 		if lastUsage != nil {
-			pt, _ := lastUsage["prompt_tokens"].(float64)
-			ct, _ := lastUsage["completion_tokens"].(float64)
-			tt, _ := lastUsage["total_tokens"].(float64)
-			if tt == 0 && pt+ct > 0 {
-				tt = pt + ct
-			}
-			if tt > 0 {
-				recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-			}
+			recordUsageFromMap(req.Model, lastUsage)
 		}
 		return
 	}
@@ -4134,15 +4588,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	var usageResp2 map[string]any
 	if json.Unmarshal(respBody, &usageResp2) == nil {
 		if u, ok := usageResp2["usage"].(map[string]any); ok {
-			pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
-			ct, _ := getFloat(u, "completion_tokens", "output_tokens")
-			tt, _ := getFloat(u, "total_tokens")
-			if tt == 0 && pt+ct > 0 {
-				tt = pt + ct
-			}
-			if tt > 0 {
-				recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-			}
+			recordUsageFromMap(req.Model, u)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -4164,8 +4610,12 @@ func imagesGenerationsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	body, err := readRequestBody(r, maxJSONRequestBodyBytes)
 	if err != nil {
+		if tooLarge, ok := err.(*requestBodyTooLargeError); ok {
+			writeRequestBodyTooLarge(w, tooLarge)
+			return
+		}
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -4214,6 +4664,8 @@ func imagesGenerationsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// 图片生成按次数统计（无 token 计量），token 字段留 0 只增 RequestCount。
+	recordTokenUsage(req.Model, 0, 0, 0)
 	copyFilteredResponseHeaders(w.Header(), upHeader)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -4232,8 +4684,12 @@ func imagesEditsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 30*1024*1024)) // 图片编辑含文件，放宽到 30MB
+	body, err := readRequestBody(r, maxMultipartRequestBodyBytes)
 	if err != nil {
+		if tooLarge, ok := err.(*requestBodyTooLargeError); ok {
+			writeRequestBodyTooLarge(w, tooLarge)
+			return
+		}
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -4306,6 +4762,8 @@ func imagesEditsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// 图片编辑按次数统计（无 token 计量），token 字段留 0 只增 RequestCount。
+	recordTokenUsage(resolvedModel, 0, 0, 0)
 	copyFilteredResponseHeaders(w.Header(), upHeader)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -4779,8 +5237,12 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	body, err := readRequestBody(r, maxJSONRequestBodyBytes)
 	if err != nil {
+		if tooLarge, ok := err.(*requestBodyTooLargeError); ok {
+			writeRequestBodyTooLarge(w, tooLarge)
+			return
+		}
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -4806,7 +5268,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 上游是 Anthropic 类型时，下游入口与上游同为 Anthropic 协议，直接透传
 	if upstream != nil && upstream.APIType == UpstreamAnthropic {
-		rawBody, err := prepareAnthropicPassthroughBody(body, anthropicReq.Model)
+		rawBody, err := prepareAnthropicPassthroughBody(body, anthropicReq.Model, !upstream.DisableAnthropicAutoCache)
 		if err != nil {
 			log.Printf("[request invalid] path=/v1/messages mode=passthrough ip=%s model=%q err=%v", ip, anthropicReq.Model, err)
 			w.Header().Set("Content-Type", "application/json")
@@ -4861,12 +5323,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		var usageResp map[string]any
 		if json.Unmarshal(respBody, &usageResp) == nil {
 			if u, ok := usageResp["usage"].(map[string]any); ok {
-				it, _ := u["input_tokens"].(float64)
-				ot, _ := u["output_tokens"].(float64)
-				tt := it + ot
-				if tt > 0 {
-					recordTokenUsage(anthropicReq.Model, int64(it), int64(ot), int64(tt))
-				}
+				recordUsageFromMap(anthropicReq.Model, u)
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -4881,22 +5338,6 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	// 上游非 Anthropic 类型，走 Chat 中间格式转换
 
 	messages := anthropicToOpenAIMessages(anthropicReq.Messages, anthropicReq.System)
-	// 多模态路由：只按"本轮新增图片"判定（历史图片不锁定多模态路由）。
-	// 配置了 multimodal_model 且本轮带图 → 切换到多模态模型与对应上游/代理；
-	// 否则保持 target_model。路由到纯文本模型时剥离所有历史图片。
-	if modelAliasInfo.MultimodalModel != "" {
-		var useMM bool
-		if hasNewImageContent(messages) {
-			useMM = true
-		} else {
-			messages = stripImagesForTextModel(messages)
-		}
-		modelName, upName, up, proxy := resolveEffectiveModel(modelAliasInfo, anthropicReq.Model, upstreamName, upstream, useMM)
-		anthropicReq.Model = modelName
-		upstreamName = upName
-		upstream = up
-		modelAliasInfo.Socks5Proxy = proxy
-	}
 	messages = fixToolCallGaps(messages)
 	var toolArgsErr error
 	messages, toolArgsErr = normalizeMessagesToolCallArguments(messages)
@@ -4996,12 +5437,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	var usageResp2 map[string]any
 	if json.Unmarshal(respBody, &usageResp2) == nil {
 		if u, ok := usageResp2["usage"].(map[string]any); ok {
-			pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
-			ct, _ := getFloat(u, "completion_tokens", "output_tokens")
-			tt, _ := getFloat(u, "total_tokens")
-			if tt > 0 {
-				recordTokenUsage(anthropicReq.Model, int64(pt), int64(ct), int64(tt))
-			}
+			recordUsageFromMap(anthropicReq.Model, u)
 		}
 	}
 
@@ -5041,12 +5477,7 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 	fullUsage := map[string]any{}
 	defer func() {
 		if len(fullUsage) > 0 {
-			pt, _ := fullUsage["prompt_tokens"].(float64)
-			ct, _ := fullUsage["completion_tokens"].(float64)
-			tt, _ := fullUsage["total_tokens"].(float64)
-			if tt > 0 {
-				recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
-			}
+			recordUsageFromMap(model, fullUsage)
 		}
 	}()
 
@@ -5269,7 +5700,9 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 			fullUsage = usage
 		}
 
-		if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
+		// 非空 finish_reason 即视为本轮终止（同 responsesStreamHandler 的处理）：
+		// 白名单会漏掉上游新增或第三方扩展的停止原因，导致流不收尾、客户端一直挂起。
+		if finishReason != "" {
 			closeThinkingBlock()
 			closeTextBlock()
 
@@ -5289,11 +5722,19 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 			// 已收尾的工具块不再重复 stop（上游异常多发 finish_reason 时会重复）
 			toolCallOrder = nil
 
+			// finish_reason -> Anthropic stop_reason。
+			// refusal 必须原样保留：它是 Anthropic 的合法终态，代表模型按安全策略拒答
+			// （HTTP 200 的正常响应）。若归入 default 变成 end_turn，客户端会把
+			// 「拒答」误读成「回答完了但内容是空的」。
 			switch finishReason {
 			case "length":
 				finalStopReason = "max_tokens"
 			case "tool_calls", "function_call":
 				finalStopReason = "tool_use"
+			case "refusal":
+				finalStopReason = "refusal"
+			case "stop", "content_filter":
+				finalStopReason = "end_turn"
 			default:
 				finalStopReason = "end_turn"
 			}
@@ -5392,11 +5833,7 @@ func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser,
 
 	defer func() {
 		if len(fullUsage) > 0 {
-			pt, _ := fullUsage["input_tokens"].(float64)
-			ct, _ := fullUsage["output_tokens"].(float64)
-			if pt > 0 || ct > 0 {
-				recordTokenUsage(model, int64(pt), int64(ct), int64(pt+ct))
-			}
+			recordUsageFromMap(model, fullUsage)
 		}
 	}()
 
@@ -5571,60 +6008,32 @@ func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser,
 			deltaObj, _ := event["delta"].(map[string]any)
 			if deltaObj != nil {
 				stopReason, _ := deltaObj["stop_reason"].(string)
-				finishReason := ""
-				switch stopReason {
-				case "end_turn":
-					finishReason = "stop"
-				case "max_tokens":
-					finishReason = "length"
-				case "tool_use":
-					finishReason = "tool_calls"
-				default:
-					if stopReason != "" {
-						finishReason = stopReason
-					}
-				}
+				finishReason := anthropicStopReasonToFinishReason(stopReason)
 				usage, _ := event["usage"].(map[string]any)
 				if usage != nil {
-					if ot, ok := usage["output_tokens"].(float64); ok {
-						fullUsage["output_tokens"] = ot
-					}
-				}
-				chatUsage := map[string]any{}
-				if pt, ok := fullUsage["input_tokens"].(float64); ok {
-					chatUsage["prompt_tokens"] = int64(pt)
-				}
-				if ot, ok := fullUsage["output_tokens"].(float64); ok {
-					chatUsage["completion_tokens"] = int64(ot)
-				}
-				if _, ok := chatUsage["prompt_tokens"]; !ok {
-					if u, ok2 := event["usage"].(map[string]any); ok2 {
-						if it, ok3 := u["input_tokens"].(float64); ok3 {
-							chatUsage["prompt_tokens"] = int64(it)
-							fullUsage["input_tokens"] = it
+					// message_delta 的 usage 是整轮最终值：input/cache 各段与 output 一并并入，
+					// 只取 output_tokens 会把缓存口径下的输入统计丢掉。
+					for _, k := range []string{"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"} {
+						if v, ok := usage[k]; ok {
+							fullUsage[k] = v
 						}
 					}
 				}
-				if _, ok := chatUsage["completion_tokens"]; !ok {
-					if u, ok2 := event["usage"].(map[string]any); ok2 {
-						if ot, ok3 := u["output_tokens"].(float64); ok3 {
-							chatUsage["completion_tokens"] = int64(ot)
-							fullUsage["output_tokens"] = ot
-						}
-					}
+				chatUsage := anthropicUsageToOpenAI(fullUsage)
+				if chatUsage == nil {
+					chatUsage = map[string]any{}
 				}
-				pt := float64(0)
-				if v, ok := chatUsage["prompt_tokens"].(int64); ok {
-					pt = float64(v)
-				}
-				ct := float64(0)
-				if v, ok := chatUsage["completion_tokens"].(int64); ok {
-					ct = float64(v)
-				}
-				chatUsage["total_tokens"] = int64(pt + ct)
 				if !roleSent {
 					emitChatChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
 					roleSent = true
+				}
+				// 拒答时上游 content 为空，只给 finish_reason 会让用户看到「一片空白」。
+				// Anthropic 在 message_delta 里带 stop_details（category/explanation），
+				// 把它合成一段可读文本，客户端才能展示拒绝原因。
+				if stopReason == "refusal" {
+					if text := refusalNoticeText(event); text != "" {
+						emitChatChunk(map[string]any{"content": text}, nil, nil)
+					}
 				}
 				emitChatChunk(map[string]any{}, finishReason, chatUsage)
 			}
@@ -5660,74 +6069,6 @@ func contentHasImage(content any) bool {
 		}
 	}
 	return false
-}
-
-// hasNewImageContent 只检测"本轮"是否新增了图片，用于多模态路由判定。
-// codex 每轮请求都携带完整历史，历史图片不应影响本轮路由。
-// 判定策略（已用 codex 真实请求结构验证）：
-//
-//	① 最后一个 user 消息自身 content 含图 → 本轮新增图片（最常见）
-//	② 最后一个 user 消息紧邻的前 1 条是 tool 输出且含图 → 本轮 view_image 场景
-//
-// 其余情况（包括历史图片）都不视为本轮新增，返回 false。
-func hasNewImageContent(messages []Message) bool {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			if contentHasImage(messages[i].Content) {
-				return true
-			}
-			if i-1 >= 0 && messages[i-1].Role == "tool" &&
-				contentHasImage(messages[i-1].Content) {
-				return true
-			}
-			return false
-		}
-	}
-	return false
-}
-
-// stripImagesForTextModel 路由到纯文本模型（无多模态模型）时调用：
-// 把请求中所有图片 part 替换为文本占位，避免纯文本模型上游报错。
-// 因为 codex 每轮携带全量历史，历史图片也必须一并剥离。
-func stripImagesForTextModel(messages []Message) []Message {
-	for i := range messages {
-		parts, ok := messages[i].Content.([]any)
-		if !ok {
-			continue
-		}
-		changed := false
-		cleaned := make([]any, 0, len(parts))
-		for _, p := range parts {
-			block, ok := p.(map[string]any)
-			if !ok {
-				// 裸字符串元素：包成 text block（content 数组规范要求元素为对象，
-				// 混合数组 [字符串, 图片] 剥离后残留的裸字符串会导致上游报
-				// "invalid type: string, expected ...ContentBlock"）
-				if s, ok := p.(string); ok {
-					cleaned = append(cleaned, map[string]any{"type": "text", "text": s})
-					changed = true
-				} else {
-					cleaned = append(cleaned, p)
-				}
-				continue
-			}
-			switch block["type"] {
-			case "image_url", "input_image", "image":
-				// 图片 → 文本占位（文本模型不认图，但认得上下文说明）
-				cleaned = append(cleaned, map[string]any{
-					"type": "text",
-					"text": "[图片已省略]",
-				})
-				changed = true
-			default:
-				cleaned = append(cleaned, p)
-			}
-		}
-		if changed {
-			messages[i].Content = cleaned
-		}
-	}
-	return messages
 }
 
 func responsesInputToMessages(input any, instructions string) []Message {
@@ -5889,9 +6230,10 @@ func responsesInputToMessages(input any, instructions string) []Message {
 					} else {
 						flushPendingAssistant()
 						content := responsesContentToChatContent(elem["content"])
-						if role == "system" {
-							content = extractTextFromContentParts(elem["content"])
-						}
+						// system 用 responsesContentToChatContent 的结果而非
+						// extractTextFromContentParts 压平 —— 后者会丢掉
+						// cache_control 断点（块级属性，压平即失效）。
+						// 纯文本场景该函数同样返回字符串，行为不变。
 						// tool 输出的图片附加到 user 消息（mimo 等上游不接受 tool 消息带图）
 						if role == "user" && len(pendingImages) > 0 {
 							parts := []any{content}
@@ -6112,12 +6454,17 @@ func convertResponsesToolsWithMappings(tools []ResponsesTool) ([]Tool, map[strin
 
 func responsesToolFunction(tool ResponsesTool, namespace string) (ToolFunction, bool) {
 	fn := ToolFunction{
-		Name:        tool.Name,
-		Description: tool.Description,
-		Parameters:  tool.Parameters,
+		Name:         tool.Name,
+		Description:  tool.Description,
+		Parameters:   tool.Parameters,
+		CacheControl: tool.CacheControl,
 	}
 	if tool.Function != nil {
 		fn = *tool.Function
+		// tool 层的断点优先级低于 function 层，仅在 function 未声明时补上
+		if fn.CacheControl == nil {
+			fn.CacheControl = tool.CacheControl
+		}
 	}
 	fn.Name = strings.TrimSpace(fn.Name)
 	if fn.Name == "" {
@@ -6237,6 +6584,9 @@ func responsesContentToChatContent(content any) any {
 	var converted []any
 	var textParts []string
 	hasImage := false
+	// hasBreakpoint：任一块带 cache_control 时不能压平成纯字符串 ——
+	// 断点是块级属性，压平后 Anthropic 上游永远不命中 prompt cache。
+	hasBreakpoint := false
 	for _, p := range parts {
 		part, ok := p.(map[string]any)
 		if !ok {
@@ -6247,7 +6597,12 @@ func responsesContentToChatContent(content any) any {
 		case "input_text", "output_text", "summary_text", "text":
 			if text, ok := part["text"].(string); ok && text != "" {
 				textParts = append(textParts, text)
-				converted = append(converted, map[string]any{"type": "text", "text": text})
+				block := map[string]any{"type": "text", "text": text}
+				if cc, hasCC := part["cache_control"]; hasCC && cc != nil {
+					block["cache_control"] = cc
+					hasBreakpoint = true
+				}
+				converted = append(converted, block)
 			}
 		case "input_image", "image_url":
 			imageURL := responsesImageURLFromPart(part)
@@ -6260,7 +6615,7 @@ func responsesContentToChatContent(content any) any {
 	if len(converted) == 0 {
 		return ""
 	}
-	if hasImage {
+	if hasImage || hasBreakpoint {
 		return converted
 	}
 	return strings.Join(textParts, "\n")
@@ -6327,8 +6682,12 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	body, err := readRequestBody(r, maxJSONRequestBodyBytes)
 	if err != nil {
+		if tooLarge, ok := err.(*requestBodyTooLargeError); ok {
+			writeRequestBodyTooLarge(w, tooLarge)
+			return
+		}
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -6403,15 +6762,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		var usageResp map[string]any
 		if json.Unmarshal(respBody, &usageResp) == nil {
 			if u, ok := usageResp["usage"].(map[string]any); ok {
-				pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
-				ct, _ := getFloat(u, "completion_tokens", "output_tokens")
-				tt, _ := getFloat(u, "total_tokens")
-				if tt == 0 && pt+ct > 0 {
-					tt = pt + ct
-				}
-				if tt > 0 {
-					recordTokenUsage(respReq.Model, int64(pt), int64(ct), int64(tt))
-				}
+				recordUsageFromMap(respReq.Model, u)
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -6428,24 +6779,6 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		messages = responsesInputToMessages(respReq.Input, respReq.Instructions)
 	} else if respReq.Instructions != "" {
 		messages = append([]Message{{Role: "system", Content: respReq.Instructions}}, messages...)
-	}
-
-	// 多模态路由：只按"本轮新增图片"判定（历史图片不锁定多模态路由）。
-	// 配置了 multimodal_model 且本轮带图 → 切换到多模态模型与对应上游/代理；
-	// 否则保持 target_model。路由到纯文本模型时剥离所有历史图片。
-	if modelAliasInfo.MultimodalModel != "" {
-		var useMM bool
-		if hasNewImageContent(messages) {
-			useMM = true
-		} else {
-			// 纯文本轮次：剥离历史图片，避免纯文本上游（如 deepseek）报错
-			messages = stripImagesForTextModel(messages)
-		}
-		modelName, upName, up, proxy := resolveEffectiveModel(modelAliasInfo, respReq.Model, upstreamName, upstream, useMM)
-		respReq.Model = modelName
-		upstreamName = upName
-		upstream = up
-		modelAliasInfo.Socks5Proxy = proxy
 	}
 
 	chatReq := OpenAIRequest{
@@ -6558,15 +6891,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	var usageResp2 map[string]any
 	if json.Unmarshal(respBody, &usageResp2) == nil {
 		if u, ok := usageResp2["usage"].(map[string]any); ok {
-			pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
-			ct, _ := getFloat(u, "completion_tokens", "output_tokens")
-			tt, _ := getFloat(u, "total_tokens")
-			if tt == 0 && pt+ct > 0 {
-				tt = pt + ct
-			}
-			if tt > 0 {
-				recordTokenUsage(chatReq.Model, int64(pt), int64(ct), int64(tt))
-			}
+			recordUsageFromMap(chatReq.Model, u)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -6947,7 +7272,11 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		if usage, ok := chunk["usage"].(map[string]any); ok {
 			totalUsage = usage
 		}
-		if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
+		// 只要上游给出了非空 finish_reason，就说明本轮已正常终止 —— 用白名单会让
+		// 未列举的值（如上游新增的停止原因）被误判成「流异常中断」，最终
+		// status=incomplete 且 output 为空。改用「非空即终态」，白名单仅用于区分
+		// length（截断）这类需要标记 incomplete 的特殊情况。
+		if finishReason != "" {
 			terminalFinishSeen = true
 			if finishReason == "length" {
 				isIncomplete = true
@@ -7136,12 +7465,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	completedResponse["usage"] = usage
 
 	if len(totalUsage) > 0 {
-		pt, _ := getFloat(totalUsage, "prompt_tokens", "input_tokens")
-		ct, _ := getFloat(totalUsage, "completion_tokens", "output_tokens")
-		tt := pt + ct
-		if tt > 0 {
-			recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
-		}
+		recordUsageFromMap(model, totalUsage)
 	}
 
 	emitSSEEvent(w, flusher, "response."+responseStatus, map[string]any{
@@ -7329,6 +7653,274 @@ func emitSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, dat
 
 // ======================== Admin 管理页面 ========================
 
+// upstreamModelTestHandler probes the draft configuration without saving it or updating usage stats.
+func upstreamModelTestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input struct {
+		UpstreamConfig
+		Model               string       `json:"model"`
+		TokenLimitParameter string       `json:"token_limit_parameter"`
+		Proxy               *Socks5Proxy `json:"proxy"` // optional SOCKS5 exit from the (unsaved) form; nil means direct
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&input); err != nil {
+		http.Error(w, "无效或过大的测试配置", http.StatusBadRequest)
+		return
+	}
+	input.Model = strings.TrimSpace(input.Model)
+	input.BaseURL = strings.TrimSpace(input.BaseURL)
+	u, err := url.Parse(input.BaseURL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || input.Model == "" {
+		http.Error(w, "请填写有效的 HTTP(S) Base URL 和模型名称", http.StatusBadRequest)
+		return
+	}
+	if input.APIType == "" {
+		input.APIType = UpstreamOpenAI
+	}
+	var proxy *Socks5Proxy
+	if input.Proxy != nil && strings.TrimSpace(input.Proxy.Addr) != "" {
+		p := *input.Proxy
+		p.Addr = strings.TrimSpace(p.Addr)
+		if _, port, err := net.SplitHostPort(p.Addr); err != nil || port == "" {
+			http.Error(w, "代理地址格式应为 host:port", http.StatusBadRequest)
+			return
+		}
+		proxy = &p
+	}
+	payload := map[string]any{"model": input.Model, "stream": false}
+	switch input.APIType {
+	case UpstreamOpenAI:
+		payload["messages"] = []map[string]string{{"role": "user", "content": "Reply with OK only."}}
+		limitParameter := input.TokenLimitParameter
+		if limitParameter == "" {
+			limitParameter = "max_tokens"
+		}
+		if limitParameter != "max_tokens" && limitParameter != "max_completion_tokens" {
+			http.Error(w, "无效的 Token 限制参数", http.StatusBadRequest)
+			return
+		}
+		payload[limitParameter] = 256
+	case UpstreamAnthropic:
+		payload["messages"] = []map[string]string{{"role": "user", "content": "Reply with OK only."}}
+		payload["max_tokens"] = 256
+	case UpstreamResponses:
+		payload["input"] = "Reply with OK only."
+		payload["max_output_tokens"] = 256
+	default:
+		http.Error(w, "不支持的接口类型", http.StatusBadRequest)
+		return
+	}
+	keys := getUpstreamAPIKeys(&input.UpstreamConfig)
+	key := ""
+	if len(keys) > 0 {
+		key = keys[0]
+	}
+	body, _ := json.Marshal(payload)
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	started := time.Now()
+	// key_status: valid | invalid (401/403) | limited (402/429) | unknown (network, upstream or format errors).
+	result := map[string]any{"success": false, "model": input.Model, "key_status": "unknown"}
+	defer func() {
+		result["latency_ms"] = time.Since(started).Milliseconds()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(result)
+	}()
+	req, err := buildUpstreamRequest(getUpstreamEndpoint(&input.UpstreamConfig), key, body, &input.UpstreamConfig, nil)
+	if err != nil {
+		result["error"] = "无法构建上游请求"
+		return
+	}
+	if input.APIType == UpstreamAnthropic {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+	// Do not follow redirects with credentials or mutate the shared client.
+	client := *httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if proxy != nil {
+		// One-shot transport so draft proxy settings are tested without touching the cached clients.
+		transport := newBaseTransport()
+		transport.DialContext = socks5Dial(*proxy)
+		defer transport.CloseIdleConnections()
+		client.Transport = transport
+		result["proxy"] = proxy.Addr
+	} else {
+		result["proxy"] = "direct"
+	}
+	var firstByte time.Time
+	trace := &httptrace.ClientTrace{GotFirstResponseByte: func() { firstByte = time.Now() }}
+	resp, err := client.Do(req.WithContext(httptrace.WithClientTrace(ctx, trace)))
+	if err != nil {
+		if ctx.Err() != nil {
+			result["error"] = "测试超时（60 秒）或已取消"
+		} else if proxy != nil && strings.Contains(err.Error(), "socks5") {
+			// socks5Dial errors describe the proxy hop, not the upstream; credentials are never included.
+			msg := err.Error()
+			if i := strings.Index(msg, "socks5"); i >= 0 {
+				msg = msg[i:]
+			}
+			result["error"] = "代理出口失败: " + msg
+			result["proxy_error"] = true
+		} else {
+			result["error"] = "连接上游失败，请检查地址、网络及 TLS 配置"
+		}
+		return
+	}
+	defer resp.Body.Close()
+	if !firstByte.IsZero() {
+		result["ttfb_ms"] = firstByte.Sub(started).Milliseconds()
+	}
+	result["status_code"] = resp.StatusCode
+	data, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil || len(data) > 1<<20 {
+		result["error"] = "上游响应读取失败或超过 1 MiB"
+		return
+	}
+	redact := func(s string) string {
+		for _, k := range keys {
+			s = strings.ReplaceAll(s, k, "[REDACTED]")
+		}
+		runes := []rune(s)
+		if len(runes) > 500 {
+			return string(runes[:500]) + "…"
+		}
+		return s
+	}
+	if code := upstreamErrorCode(data); code != "" {
+		result["error_code"] = redact(code)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			result["key_status"] = "invalid"
+		case http.StatusPaymentRequired, http.StatusTooManyRequests:
+			result["key_status"] = "limited"
+		}
+		result["error"] = redact(fmt.Sprintf("上游 HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data))))
+		return
+	}
+	text, err := modelTestResponseText(data, input.APIType)
+	if err != nil {
+		// A recognized model response without text still proves the key was accepted.
+		if errors.Is(err, errModelTestNoText) {
+			result["key_status"] = "valid"
+		}
+		result["error"] = redact(err.Error())
+		return
+	}
+	result["success"] = true
+	result["key_status"] = "valid"
+	result["reply"] = redact(text)
+}
+
+// upstreamErrorCode returns error.code, falling back to error.type, so the UI can group failed keys.
+func upstreamErrorCode(data []byte) string {
+	var body struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(data, &body) != nil || len(body.Error) == 0 {
+		return ""
+	}
+	var e struct {
+		Code any    `json:"code"`
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(body.Error, &e) != nil {
+		return ""
+	}
+	code := ""
+	switch v := e.Code.(type) {
+	case string:
+		code = strings.TrimSpace(v)
+	case float64:
+		code = strconv.FormatFloat(v, 'f', -1, 64)
+	}
+	if code == "" {
+		code = strings.TrimSpace(e.Type)
+	}
+	if runes := []rune(code); len(runes) > 80 {
+		code = string(runes[:80])
+	}
+	return code
+}
+
+var errModelTestNoText = errors.New("未收到有效文本回复（可能是模型不支持文本、推理预算不足或响应格式不兼容）")
+
+// modelTestResponseText extracts reply text from a non-streaming response. It decodes
+// generically so provider variations (null or array content) do not hide a working key.
+func modelTestResponseText(data []byte, apiType UpstreamType) (string, error) {
+	excerpt := func() string {
+		runes := []rune(strings.TrimSpace(string(data)))
+		if len(runes) > 200 {
+			return string(runes[:200]) + "…"
+		}
+		return string(runes)
+	}
+	var obj map[string]any
+	if json.Unmarshal(data, &obj) != nil {
+		return "", fmt.Errorf("上游未返回有效的 JSON 模型响应: %s", excerpt())
+	}
+	if e, ok := obj["error"]; ok && e != nil {
+		b, _ := json.Marshal(e)
+		return "", fmt.Errorf("上游返回错误: %s", b)
+	}
+	collect := func(blocks any, kind string, text *strings.Builder) {
+		switch v := blocks.(type) {
+		case string:
+			text.WriteString(v)
+		case []any:
+			for _, item := range v {
+				if m, ok := item.(map[string]any); ok && m["type"] == kind {
+					if s, ok := m["text"].(string); ok {
+						text.WriteString(s)
+					}
+				}
+			}
+		}
+	}
+	var text strings.Builder
+	recognized := false
+	switch apiType {
+	case UpstreamOpenAI:
+		if choices, ok := obj["choices"].([]any); ok {
+			recognized = true
+			if len(choices) > 0 {
+				choice, _ := choices[0].(map[string]any)
+				message, _ := choice["message"].(map[string]any)
+				collect(message["content"], "text", &text)
+			}
+		}
+	case UpstreamAnthropic:
+		if _, ok := obj["content"].([]any); ok {
+			recognized = true
+			collect(obj["content"], "text", &text)
+		}
+	case UpstreamResponses:
+		if status, _ := obj["status"].(string); status == "failed" || status == "cancelled" {
+			return "", fmt.Errorf("上游响应状态: %s", status)
+		}
+		if output, ok := obj["output"].([]any); ok {
+			recognized = true
+			for _, item := range output {
+				if m, ok := item.(map[string]any); ok {
+					collect(m["content"], "output_text", &text)
+				}
+			}
+		}
+	}
+	if !recognized {
+		return "", fmt.Errorf("上游响应格式无法识别: %s", excerpt())
+	}
+	if strings.TrimSpace(text.String()) == "" {
+		return "", errModelTestNoText
+	}
+	return text.String(), nil
+}
+
 func upstreamModelsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -7445,6 +8037,22 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"Invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
+		// Reject blank or duplicate proxy rows instead of letting normalizeConfig drop them silently.
+		seenProxyRefs := map[string]int{}
+		for i, proxy := range cfg.Socks5Proxies {
+			proxy.Addr = strings.TrimSpace(proxy.Addr)
+			proxy.Username = strings.TrimSpace(proxy.Username)
+			if proxy.Addr == "" {
+				writeJSONError(w, fmt.Sprintf("SOCKS5 代理第 %d 行未填写地址", i+1))
+				return
+			}
+			ref := socks5ProxyRef(proxy)
+			if first, dup := seenProxyRefs[ref]; dup {
+				writeJSONError(w, fmt.Sprintf("SOCKS5 代理第 %d 行与第 %d 行的地址和用户名都相同（%s）；同一地址的多个代理需要使用不同的用户名", i+1, first, ref))
+				return
+			}
+			seenProxyRefs[ref] = i + 1
+		}
 		normalizeConfig(&cfg)
 		if empty := emptyCustomModelUpstreams(cfg.Upstreams); len(empty) > 0 {
 			msg := "以下上游未配置模型，请点击\"获取模型列表\"或手动填写：" + strings.Join(empty, "、")
@@ -7459,30 +8067,16 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-			// 多模态独立上游同样校验
-			if mmUpstream := strings.TrimSpace(alias.MultimodalUpstream); mmUpstream != "" {
-				if _, ok := cfg.Upstreams[mmUpstream]; !ok {
-					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的多模态上游 `+mmUpstream+` 不存在"}`, http.StatusBadRequest)
-					return
-				}
-			}
 		}
 		// 校验别名引用的 SOCKS5 代理是否存在（不再静默清空，避免用户不知情丢失配置）
 		proxyAddrSet := make(map[string]struct{}, len(cfg.Socks5Proxies))
 		for _, proxy := range cfg.Socks5Proxies {
-			proxyAddrSet[strings.TrimSpace(proxy.Addr)] = struct{}{}
+			proxyAddrSet[socks5ProxyRef(proxy)] = struct{}{}
 		}
 		for aliasKey, alias := range cfg.ModelAlias {
 			if aliasProxy := strings.TrimSpace(alias.Socks5Proxy); aliasProxy != "" {
 				if _, ok := proxyAddrSet[aliasProxy]; !ok {
 					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的代理 `+aliasProxy+` 不存在"}`, http.StatusBadRequest)
-					return
-				}
-			}
-			// 多模态独立代理同样校验
-			if mmProxy := strings.TrimSpace(alias.MultimodalSocks5Proxy); mmProxy != "" {
-				if _, ok := proxyAddrSet[mmProxy]; !ok {
-					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的多模态代理 `+mmProxy+` 不存在"}`, http.StatusBadRequest)
 					return
 				}
 			}
@@ -7500,6 +8094,13 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// writeJSONError sends a 400 with {"error": msg}, escaping msg properly.
+func writeJSONError(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
@@ -7783,6 +8384,10 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .think-row input[type="checkbox"]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
 .think-row label{font-size:13px;font-weight:500;cursor:pointer;margin:0;color:var(--text)}
 .think-row .hint{font-size:11px;color:var(--text-ter);margin:0 0 0 auto;white-space:nowrap}
+.batch-model-panel label{display:flex;align-items:center;gap:6px;margin:0;font-size:13px;font-weight:400;color:var(--text);letter-spacing:0;text-transform:none;cursor:pointer;min-width:0}
+.batch-model-panel label input[type="checkbox"]{flex:none;width:16px;height:16px;margin:0;accent-color:var(--accent);cursor:pointer}
+.batch-model-panel label span{min-width:0;overflow-wrap:break-word;font-family:var(--mono);font-size:12px;color:var(--text);text-transform:none}
+.batch-model-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:4px 16px}
 @media(max-width:700px){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}.effort-label-row,.effort-row{grid-template-columns:minmax(90px,1fr) 22px minmax(90px,1fr) auto}.upstream-form-grid{grid-template-columns:1fr}.upstream-field.full{grid-column:auto}.upstream-summary-url{display:none}.upstream-summary-meta{margin-left:auto}}
 .theme-toggle{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 12px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all .15s;color:var(--text-sec);flex-shrink:0;line-height:1}
 .theme-toggle:hover{border-color:var(--border-light);color:var(--text)}
@@ -7820,20 +8425,18 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 
 <div class="config-grid">
 <div class="card full-row">
-<div class="panel-header">
 <h2><span class="dot" style="background:var(--green)"></span>多上游配置</h2>
-<div class="btns">
+<div class="upstream-list" id="upstreamList"></div>
+<div class="actions">
 <button class="btn btn-primary" onclick="addUpstreamRow()">添加上游</button>
 <button class="btn btn-success" onclick="saveConfig('上游配置')">保存上游</button>
 </div>
-</div>
-<div class="upstream-list" id="upstreamList"></div>
 </div>
 <div class="card full-row">
 <h2><span class="dot" style="background:var(--accent)"></span>模型映射</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="aliasTable">
-<thead><tr><th rowspan="2" style="width:13%">别名（客户端请求名）</th><th colspan="3">主路由</th><th rowspan="2" style="width:4%"></th></tr><tr><th colspan="3">多模态路由</th></tr></thead>
+<thead><tr><th style="width:13%">别名（客户端请求名）</th><th>上游</th><th>模型</th><th>代理出口</th><th style="width:4%"></th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
@@ -7878,37 +8481,61 @@ function upstreamTypeLabel(value){if(value==='anthropic')return 'Anthropic';if(v
 function nonEmptyLineCount(value){return String(value||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean).length}
 function customModelCount(value){return String(value||'').split(',').map(s=>s.trim()).filter(Boolean).length}
 function responsesReasoningFormatHtml(value){const legacy=['reasoning_effort','legacy','legacy_reasoning_effort'].includes(value);return '<select data-field="responses_reasoning_format"><option value=""'+(!legacy?' selected':'')+'>标准 reasoning.effort</option><option value="legacy_reasoning_effort"'+(legacy?' selected':'')+'>兼容 reasoning_effort</option></select>'}
-function upstreamCardHtml(name,up,expanded){up=up||{};const apiType=up.api_type||'openai';const baseURL=up.base_url||'';const apiKey=up.api_key||'';const customModels=(up.custom_models||[]).join(',');const keyCount=nonEmptyLineCount(apiKey);const modelCount=(up.custom_models||[]).length;let h='<details class="upstream-item" data-original-name="'+esc(name||'')+'"'+(expanded?' open':'')+'>';h+='<summary><span class="upstream-summary-name">'+esc(name||'未命名上游')+'</span><span class="upstream-type-badge">'+upstreamTypeLabel(apiType)+'</span><span class="upstream-summary-url">'+esc(baseURL||'尚未配置 Base URL')+'</span><span class="upstream-summary-meta">'+keyCount+' Key · '+modelCount+' 模型</span></summary>';h+='<div class="upstream-body"><div class="upstream-form-grid">';h+='<div class="upstream-field"><label>名称</label><input value="'+esc(name||'')+'" data-field="name" placeholder="例如: main" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field"><label>接口类型</label>'+apiTypeSelectHtml(apiType)+'</div>';h+='<div class="upstream-field full"><label>Base URL</label><input value="'+esc(baseURL)+'" data-field="base_url" placeholder="https://example.com/v1" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field full"><label>API Key（每行一个）</label><textarea data-field="api_key" placeholder="每行填写一个 API Key" oninput="updateUpstreamCardSummary(this)">'+esc(apiKey)+'</textarea><div class="field-hint">支持填写多个 Key，请求时按顺序轮询。</div></div>';h+='<div class="upstream-field full"><label>自定义模型</label><div class="custom-models-row"><input value="'+esc(customModels)+'" data-field="custom_models" placeholder="model-a, model-b" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"><button type="button" class="btn btn-secondary" onclick="fetchUpstreamModels(this)">获取模型列表</button></div><div class="field-hint">多个模型使用英文逗号分隔；点"获取模型列表"从上游 /models 实时拉取并填入；填入后启动/刷新不再自动拉取。</div></div>';h+='<div class="upstream-field full responses-format-field"'+(apiType==='openai-responses'?'':' style="display:none"')+'><label>Responses 推理参数格式</label>'+responsesReasoningFormatHtml(up.responses_reasoning_format||'')+'</div>';h+='</div><div class="upstream-item-actions"><button class="btn btn-danger" onclick="delUpstream(this)">删除此上游</button></div></div></details>';return h}
+function upstreamCardHtml(name,up,expanded){up=up||{};const apiType=up.api_type||'openai';const baseURL=up.base_url||'';const apiKey=up.api_key||'';const customModels=(up.custom_models||[]).join(',');const keyCount=nonEmptyLineCount(apiKey);const modelCount=(up.custom_models||[]).length;let h='<details class="upstream-item" data-original-name="'+esc(name||'')+'"'+(expanded?' open':'')+'>';h+='<summary><span class="upstream-summary-name">'+esc(name||'未命名上游')+'</span><span class="upstream-type-badge">'+upstreamTypeLabel(apiType)+'</span><span class="upstream-summary-url">'+esc(baseURL||'尚未配置 Base URL')+'</span><span class="upstream-summary-meta">'+keyCount+' Key · '+modelCount+' 模型</span></summary>';h+='<div class="upstream-body"><div class="upstream-form-grid">';h+='<div class="upstream-field"><label>名称</label><input value="'+esc(name||'')+'" data-field="name" placeholder="例如: main" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field"><label>接口类型</label>'+apiTypeSelectHtml(apiType)+'</div>';h+='<div class="upstream-field full"><label>Base URL</label><input value="'+esc(baseURL)+'" data-field="base_url" placeholder="https://example.com/v1" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field full"><label>API Key（每行一个）</label><textarea data-field="api_key" placeholder="每行填写一个 API Key" oninput="updateUpstreamCardSummary(this)">'+esc(apiKey)+'</textarea><div class="field-hint">支持填写多个 Key，请求时按顺序轮询。</div><div class="field-hint"><button type="button" class="btn btn-secondary" onclick="dedupeUpstreamKeys(this)">删除重复 Key</button> <span class="key-dedupe-result" role="status"></span></div></div>';h+='<div class="upstream-field full"><label>自定义模型</label><div class="custom-models-row"><input value="'+esc(customModels)+'" data-field="custom_models" placeholder="model-a, model-b" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"><button type="button" class="btn btn-secondary" onclick="fetchUpstreamModels(this)">获取模型列表</button></div><div class="field-hint">多个模型使用英文逗号分隔；点"获取模型列表"从上游 /models 实时拉取并填入；填入后启动/刷新不再自动拉取。</div>'+modelTestHtml(up.custom_models)+'</div>';h+='<div class="upstream-field full responses-format-field"'+(apiType==='openai-responses'?'':' style="display:none"')+'><label>Responses 推理参数格式</label>'+responsesReasoningFormatHtml(up.responses_reasoning_format||'')+'</div>';h+='<div class="upstream-field full auto-cache-field"'+(apiType==='anthropic'?'':' style="display:none"')+'><label style="display:flex;align-items:center;justify-content:flex-start;gap:8px;margin:0;cursor:pointer;font-size:13px;font-weight:400;color:var(--text);text-transform:none;letter-spacing:0"><input type="checkbox" data-field="disable_anthropic_auto_cache" style="flex:none;width:16px;height:16px;margin:0;accent-color:var(--accent);cursor:pointer"'+(up.disable_anthropic_auto_cache?' checked':'')+'><span>关闭 Anthropic 自动 Prompt Caching</span></label><div class="field-hint">默认启用：网关自动注入 cache_control 断点（tools 末尾 + system 末尾 + 对话末尾），大幅降低多轮对话输入费用与延迟。勾选后不注入，由客户端自行管理缓存断点。</div></div>';h+='</div><div class="upstream-item-actions"><button class="btn btn-danger" onclick="delUpstream(this)">删除此上游</button></div></div></details>';return h}
+function modelTestHtml(models){return '<div class="field-hint">使用当前未保存配置（含 SOCKS5 代理表）测试，每次请求最长 60 秒、限制 256 输出 Token（取决于上游支持），可能产生费用；不验证图片/工具能力。“测试模型”用第一个 Key 检查文本回复；“验证全部 Key”用所选模型为每个 Key 各发一次请求（同时 3 个），完成后可按错误类型勾选删除 Key（可撤销，需保存后生效）；两者都走下方所选出口。“测试全部出口”用第一个 Key 依次经直连和每个代理请求所选模型，比较可用性与速度。</div><div class="custom-models-row" style="margin-top:8px;flex-wrap:wrap"><select data-field="test_proxy" aria-label="测试出口" style="flex:1 1 240px;min-width:0" onfocus="refreshTestProxies(this)">'+testProxyOptionsHtml('')+'</select><button type="button" class="btn btn-secondary" onclick="testUpstreamExits(this)">测试全部出口</button></div><div class="proxy-test-result field-hint" style="max-height:320px;overflow:auto;overflow-wrap:anywhere"></div><div class="field-hint">OpenAI 输出限制参数：<select data-field="test_token_parameter" aria-label="OpenAI 输出限制参数"><option value="max_tokens">max_tokens（通用兼容）</option><option value="max_completion_tokens">max_completion_tokens（新版 OpenAI / 推理模型）</option></select>仅 OpenAI 类型生效；若上游提示参数不支持，可切换后重试。</div><div class="custom-models-row" style="margin-top:8px;flex-wrap:wrap"><select data-field="model_test" aria-label="选择待测模型" style="flex:1 1 240px;min-width:0" onfocus="refreshTestModels(this)">'+testModelOptionsHtml(models)+'</select><button type="button" class="btn btn-secondary" onclick="testUpstreamModel(this)">测试模型</button><button type="button" class="btn btn-secondary" onclick="checkUpstreamKeys(this)">验证全部 Key</button><button type="button" class="btn btn-secondary" onclick="batchTestModels(this)">批量测试模型</button></div><div class="model-test-result field-hint" role="status" aria-live="polite" style="white-space:pre-wrap;overflow-wrap:anywhere"></div><div class="key-check-result field-hint" style="max-height:320px;overflow:auto;overflow-wrap:anywhere"></div><div class="batch-model-result field-hint" style="max-height:400px;overflow:auto;overflow-wrap:anywhere"></div>'}
+// Natural, case-insensitive order so "model-2" sorts before "model-10".
+const modelNameCollator=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
+// Keeps the first occurrence of each key; blank lines and order are preserved. Form-only, with undo.
+function dedupeKeyLines(raw){const seen=new Set();let removed=0;const lines=String(raw||'').split(/\r\n|\r|\n/).filter(line=>{const k=line.trim();if(!k)return true;if(seen.has(k)){removed++;return false}seen.add(k);return true});return {value:lines.join('\n'),removed}}
+function dedupeUpstreamKeys(btn){const card=btn.closest('.upstream-item');const input=card&&card.querySelector('[data-field="api_key"]');const note=card&&card.querySelector('.key-dedupe-result');if(!input||!note)return;const before=input.value;const r=dedupeKeyLines(before);note.textContent='';if(!r.removed){note.textContent='没有重复的 Key';return}input.value=r.value;updateUpstreamCardSummary(input);const after=input.value;note.append('已删除 '+r.removed+' 个重复 Key（保留首次出现），点击“保存上游”后生效。');const undo=document.createElement('button');undo.type='button';undo.className='btn btn-secondary';undo.style.marginLeft='8px';undo.textContent='撤销';undo.onclick=()=>{if(input.value!==after){note.textContent='Key 已被修改，无法撤销。';return}input.value=before;updateUpstreamCardSummary(input);note.textContent='已撤销，恢复 '+r.removed+' 个重复 Key。'};note.append(undo)}
+// Test exits come from the current (possibly unsaved) SOCKS5 table; the option value is the proxy addr, '' means direct.
+// Same as Go socks5ProxyRef: proxies sharing an address are told apart by username.
+function proxyRef(p){return p.username?p.username+'@'+p.addr:p.addr}
+function proxyLabel(p){return p?(p.name?p.name+' ('+proxyRef(p)+')':proxyRef(p)):'直连'}
+function currentSocks5List(){const seen=new Set();return (readSocks5Table()||socks5Data).filter(p=>p&&p.addr&&!seen.has(proxyRef(p))&&seen.add(proxyRef(p)))}
+function testProxyOptionsHtml(selected){let h='<option value="">直连</option>';for(const p of currentSocks5List())h+='<option value="'+esc(proxyRef(p))+'"'+(proxyRef(p)===selected?' selected':'')+'>'+esc(proxyLabel(p))+'</option>';return h}
+function refreshTestProxies(sel){const v=sel.value;sel.innerHTML=testProxyOptionsHtml(v);sel.value=[...sel.options].some(o=>o.value===v)?v:''}
+// Returns null for direct, the proxy object for a listed exit, or undefined when the chosen exit was removed from the table.
+function selectedTestProxy(card){const sel=card.querySelector('[data-field="test_proxy"]');const ref=sel?sel.value:'';if(!ref)return null;return currentSocks5List().find(p=>proxyRef(p)===ref)}
+async function testUpstreamExits(btn){if(btn._abort){btn._abort.abort();return}const card=btn.closest('.upstream-item');const value=field=>(card.querySelector('[data-field="'+field+'"]')||{}).value||'';const box=card.querySelector('.proxy-test-result');const model=value('model_test').trim(),baseURL=value('base_url').trim();box.textContent='';const summary=document.createElement('div');summary.setAttribute('role','status');box.append(summary);if(!baseURL||!model){summary.textContent='请先填写 Base URL 并选择待测模型';return}const exits=[null,...currentSocks5List()];const body={base_url:baseURL,api_key:value('api_key'),api_type:value('api_type'),model:model,token_limit_parameter:value('test_token_parameter')};const controller=new AbortController();btn._abort=controller;btn.textContent='停止测试';const results=exits.map(p=>({p,state:'pending'}));const rows=results.map(()=>{const row=document.createElement('div');box.append(row);return row});const render=(i)=>{const r=results[i],row=rows[i];row.textContent='';const label=document.createElement('span');const map={pending:['…','测试中',''],ok:['✓','可用','var(--green)'],blocked:['!','上游拒绝','var(--orange)'],proxy:['✗','代理不可用','var(--red)'],fail:['?','失败',''],stopped:['–','已停止','']};const s=map[r.state];label.textContent=s[0]+' '+s[1];if(s[2])label.style.color=s[2];row.append(proxyLabel(r.p)+' · ',label,r.msg?' · '+r.msg:'')};results.forEach((_,i)=>render(i));let done=0;const update=final=>{const ok=results.filter(r=>r.state==='ok').sort((a,b)=>a.ms-b.ms);summary.textContent=(final?(controller.signal.aborted?'测试已停止':'测试完成'):'测试中 '+done+'/'+exits.length)+' · '+model+'：可用 '+ok.length+'/'+exits.length+(ok.length?' · 最快 '+proxyLabel(ok[0].p)+' '+ok[0].ms+' ms':'')};update(false);let next=0;const worker=async()=>{while(next<results.length){const i=next++,r=results[i];if(controller.signal.aborted){r.state='stopped'}else{const req=new AbortController(),stop=()=>req.abort();controller.signal.addEventListener('abort',stop);const timer=setTimeout(stop,65000);try{const resp=await fetch('/api/upstream/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({},body,{proxy:r.p})),signal:req.signal});if(resp.redirected){controller.abort();throw new Error('登录已过期，请重新登录')}if(!resp.ok)throw new Error((await resp.text()).trim());const d=await resp.json();r.ms=d.latency_ms;if(d.success){r.state='ok';r.msg=d.latency_ms+' ms'+(d.ttfb_ms!=null?'（首字节 '+d.ttfb_ms+' ms）':'')}else if(d.proxy_error){r.state='proxy';r.msg=d.error}else if(d.status_code){r.state='blocked';r.msg=d.latency_ms+' ms · '+d.error}else{r.state='fail';r.msg=d.error}}catch(e){if(e.name==='AbortError'&&controller.signal.aborted)r.state='stopped';else{r.state='fail';r.msg=e.name==='AbortError'?'请求超时':e.message}}finally{clearTimeout(timer);controller.signal.removeEventListener('abort',stop)}}done++;render(i);update(false)}};try{await Promise.all(Array.from({length:results.length},worker))}finally{btn._abort=null;btn.textContent='测试全部出口';update(true);const ok=results.map((r,i)=>[r,i]).filter(([r])=>r.state==='ok').sort((a,b)=>a[0].ms-b[0].ms);if(ok.length){const sel=card.querySelector('[data-field="test_proxy"]');const pick=document.createElement('button');pick.type='button';pick.className='btn btn-secondary';pick.style.marginLeft='8px';pick.textContent='选用最快出口';pick.onclick=()=>{if(!sel)return;refreshTestProxies(sel);const ref=ok[0][0].p?proxyRef(ok[0][0].p):'';if(![...sel.options].some(o=>o.value===ref)){pick.textContent='该出口已不在代理表中';return}sel.value=ref;pick.textContent='已选用 '+proxyLabel(ok[0][0].p)};summary.append(pick)}}}
+function testModelOptionsHtml(models){const list=Array.from(new Set((Array.isArray(models)?models:String(models||'').split(',')).map(s=>String(s).trim()).filter(Boolean))).sort(modelNameCollator.compare);return list.length?list.map(m=>'<option value="'+esc(m)+'">'+esc(m)+'</option>').join(''):'<option value="">（请先填写自定义模型）</option>'}
+function refreshTestModels(sel){const card=sel.closest('.upstream-item');const input=card&&card.querySelector('[data-field="custom_models"]');const value=sel.value;sel.innerHTML=testModelOptionsHtml(input?input.value:'');if([...sel.options].some(o=>o.value===value))sel.value=value}
+async function testUpstreamModel(btn){const card=btn.closest('.upstream-item');const value=field=>(card.querySelector('[data-field="'+field+'"]')||{}).value||'';const model=value('model_test').trim();const result=card.querySelector('.model-test-result');if(!model||!value('base_url').trim()){result.textContent='请先填写 Base URL 并选择待测模型';return}const exit=selectedTestProxy(card);if(exit===undefined){result.textContent='所选代理出口已不在代理表中，请重新选择';return}const body={base_url:value('base_url').trim(),api_key:value('api_key'),api_type:value('api_type'),model:model,token_limit_parameter:value('test_token_parameter'),proxy:exit};btn.disabled=true;btn.textContent='测试中…';result.textContent='正在测试 '+model+'（'+proxyLabel(exit)+'，使用点击时的配置）…';const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),65000);try{const r=await fetch('/api/upstream/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:controller.signal});if(r.redirected)throw new Error('登录已过期，请重新登录');if(!r.ok)throw new Error(await r.text());const d=await r.json();result.textContent=(d.success?'✓ 测试通过':'✗ 测试失败')+' · '+model+' · '+proxyLabel(exit)+' · '+d.latency_ms+' ms'+(d.status_code?' · HTTP '+d.status_code:'')+'\n'+(d.success?d.reply:d.error)}catch(e){result.textContent='✗ '+model+'：'+(e.name==='AbortError'?'测试超时':e.message)}finally{clearTimeout(timer);btn.disabled=false;btn.textContent='测试模型'}}
+const KEY_STATUS={pending:['…','验证中',''],valid:['✓','有效','var(--green)'],invalid:['✗','无效或无权限','var(--red)'],limited:['!','限流或余额不足','var(--orange)'],unknown:['?','无法确定',''],stopped:['–','已停止','']};
+function maskKey(k){return k.length>12?k.slice(0,6)+'…'+k.slice(-4):k.slice(0,2)+'…'}
+function parseKeyLines(raw){const seen=new Set(),items=[];let dup=0;String(raw||'').split(/\r\n|\r|\n/).forEach((line,i)=>{const k=line.trim();if(!k)return;if(seen.has(k)){dup++;return}seen.add(k);items.push({key:k,line:i+1})});return {items,dup}}
+function setKeyRow(row,item,status,msg){const s=KEY_STATUS[status];row.textContent='';const label=document.createElement('span');label.textContent=s[0]+' '+s[1];if(s[2])label.style.color=s[2];row.append('第 '+item.line+' 行 '+maskKey(item.key)+' · ',label,msg?' · '+msg:'')}
+async function checkUpstreamKeys(btn){if(btn._abort){btn._abort.abort();return}const card=btn.closest('.upstream-item');const value=field=>(card.querySelector('[data-field="'+field+'"]')||{}).value||'';const box=card.querySelector('.key-check-result');const model=value('model_test').trim(),baseURL=value('base_url').trim(),apiType=value('api_type'),tokenParam=value('test_token_parameter');const {items,dup}=parseKeyLines(value('api_key'));box.textContent='';const summary=document.createElement('div');summary.setAttribute('role','status');box.append(summary);if(!baseURL||!model){summary.textContent='请先填写 Base URL 并选择待测模型';return}if(!items.length){summary.textContent='请先填写 API Key';return}const exit=selectedTestProxy(card);if(exit===undefined){summary.textContent='所选代理出口已不在代理表中，请重新选择';return}const controller=new AbortController();btn._abort=controller;btn.textContent='停止验证';const counts={valid:0,invalid:0,limited:0,unknown:0,stopped:0};const failed={};let done=0;const update=final=>{summary.textContent=(final?(controller.signal.aborted?'验证已停止':'验证完成'):'验证中 '+done+'/'+items.length)+' · '+model+' · '+proxyLabel(exit)+'：有效 '+counts.valid+' · 无效 '+counts.invalid+' · 受限 '+counts.limited+' · 无法确定 '+counts.unknown+(counts.stopped?' · 已停止 '+counts.stopped:'')+(dup?' · 跳过重复 '+dup:'')};const rows=items.map(item=>{const row=document.createElement('div');setKeyRow(row,item,'pending','');box.append(row);return row});update(false);let next=0;const worker=async()=>{while(next<items.length){const i=next++,item=items[i];let status='unknown',msg='',group='';if(controller.signal.aborted){status='stopped'}else{const req=new AbortController(),stop=()=>req.abort();controller.signal.addEventListener('abort',stop);const timer=setTimeout(stop,65000);try{const r=await fetch('/api/upstream/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:baseURL,api_key:item.key,api_type:apiType,model:model,token_limit_parameter:tokenParam,proxy:exit}),signal:req.signal});if(r.redirected){controller.abort();throw new Error('登录已过期，请重新登录')}if(!r.ok)throw new Error((await r.text()).trim());const d=await r.json();status=['valid','invalid','limited'].includes(d.key_status)?d.key_status:'unknown';msg=d.latency_ms+' ms'+(status==='valid'&&d.status_code?' · HTTP '+d.status_code:'')+(status!=='valid'&&d.error?' · '+d.error:'');if(status!=='valid')group=keyErrorGroup(d.status_code,d.error_code)}catch(e){if(e.name==='AbortError'&&controller.signal.aborted)status='stopped';else{msg=e.name==='AbortError'?'请求超时':e.message;group=e.name==='AbortError'?'请求超时':'请求失败'}}finally{clearTimeout(timer);controller.signal.removeEventListener('abort',stop)}}counts[status]++;if(group)(failed[group]=failed[group]||[]).push(item.key);done++;setKeyRow(rows[i],item,status,msg);update(false)}};try{await Promise.all(Array.from({length:Math.min(3,items.length)},worker))}finally{btn._abort=null;btn.textContent='验证全部 Key';update(true);renderKeyCleanup(card,failed,box)}}
+function keyErrorGroup(status,code){return (status?'HTTP '+status:'无 HTTP 响应')+(code?' · '+code:'')}
+function removeKeyLines(raw,keys){const drop=new Set(keys);return String(raw||'').split(/\r\n|\r|\n/).filter(line=>!drop.has(line.trim())).join('\n')}
+// Lists failed keys grouped by HTTP status + upstream error code; nothing is removed until the user selects groups. Changes the form only (save to apply), with undo.
+function renderKeyCleanup(card,failed,box){const input=card.querySelector('[data-field=”api_key”]');const groups=Object.keys(failed).sort();if(!input||!groups.length)return;const panel=document.createElement('div');panel.style.cssText='margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:8px';const title=document.createElement('div');title.textContent='按错误类型删除 Key（勾选后删除，只改表单，点击”保存上游”后生效）：';panel.append(title);const boxes=groups.map(g=>{const label=document.createElement('label');label.style.cssText='display:block;margin:4px 0;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.value=g;label.append(cb,' '+g+'（'+failed[g].length+' 个）');panel.append(label);return cb});const actions=document.createElement('div');actions.style.marginTop='6px';const del=document.createElement('button');del.type='button';del.className='btn btn-danger';del.textContent='删除选中的 Key';const note=document.createElement('span');note.style.marginLeft='8px';del.onclick=()=>{const picked=boxes.filter(b=>b.checked&&!b.disabled);if(!picked.length){note.textContent='请先勾选要删除的错误类型';return}const keys=picked.flatMap(b=>failed[b.value]);const before=input.value;const after=removeKeyLines(before,keys);input.value=after;updateUpstreamCardSummary(input);picked.forEach(b=>{b.disabled=true});note.textContent='已从表单删除 '+keys.length+' 个 Key（'+picked.map(b=>b.value).join('、')+'）。';const undo=document.createElement('button');undo.type='button';undo.className='btn btn-secondary';undo.style.marginLeft='8px';undo.textContent='撤销';undo.onclick=()=>{if(input.value!==after){note.textContent='Key 已被修改，无法撤销。';undo.remove();return}input.value=before;updateUpstreamCardSummary(input);picked.forEach(b=>{b.disabled=false});note.textContent='已撤销，恢复 '+keys.length+' 个 Key。';undo.remove()};note.append(undo)};actions.append(del,note);panel.append(actions);box.insertBefore(panel,box.children[1]||null)}
+async function batchTestModels(btn){const card=btn.closest('.upstream-item');const value=field=>(card.querySelector('[data-field="'+field+'"]')||{}).value||'';const box=card.querySelector('.batch-model-result');if(box.querySelector('.batch-model-panel')){const sb=box.querySelector('.batch-model-panel button');if(sb&&sb._abort)sb._abort.abort();box.textContent='';btn.textContent='批量测试模型';return}btn.textContent='收起批量测试';const baseURL=value('base_url').trim();const apiKey=value('api_key');const apiType=value('api_type');const tokenParam=value('test_token_parameter');const modelsRaw=value('custom_models');const models=Array.from(new Set(String(modelsRaw||'').split(',').map(s=>s.trim()).filter(Boolean))).sort(modelNameCollator.compare);box.textContent='';const failHint=t=>{box.textContent=t;btn.textContent='批量测试模型'};if(!baseURL){failHint('请先填写 Base URL');return}if(!models.length){failHint('请先填写自定义模型');return}const exit=selectedTestProxy(card);if(exit===undefined){failHint('所选代理出口已不在代理表中，请重新选择');return}const panel=document.createElement('div');panel.className='batch-model-panel';panel.style.cssText='margin-top:8px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)';const header=document.createElement('div');header.style.cssText='font-size:13px;margin-bottom:10px;color:var(--text)';header.innerHTML='<b>选择要测试的模型</b> <span style="color:var(--text-ter)">（使用第一个 Key，走所选出口）</span>';panel.append(header);const selAll=document.createElement('label');selAll.style.cssText='margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border);font-weight:600';const selAllCb=document.createElement('input');selAllCb.type='checkbox';selAllCb.checked=true;selAllCb.onchange=()=>cbs.forEach(c=>c.checked=selAllCb.checked);const selAllTxt=document.createElement('span');selAllTxt.textContent='全选 / 取消全选（共 '+models.length+' 个）';selAllTxt.style.fontFamily='var(--font)';selAll.append(selAllCb,selAllTxt);panel.append(selAll);const grid=document.createElement('div');grid.className='batch-model-grid';const cbs=models.map(m=>{const label=document.createElement('label');label.title=m;const cb=document.createElement('input');cb.type='checkbox';cb.value=m;cb.checked=true;const txt=document.createElement('span');txt.textContent=m;label.append(cb,txt);grid.append(label);return cb});panel.append(grid);const actions=document.createElement('div');actions.style.cssText='margin-top:12px;padding-top:10px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-wrap:wrap';const startBtn=document.createElement('button');startBtn.type='button';startBtn.className='btn btn-secondary';startBtn.textContent='开始测试';const statusSpan=document.createElement('span');actions.append(startBtn,statusSpan);panel.append(actions);const resultBox=document.createElement('div');resultBox.style.cssText='margin-top:8px';panel.append(resultBox);box.append(panel);startBtn.onclick=async()=>{const selected=cbs.filter(c=>c.checked).map(c=>c.value);if(!selected.length){statusSpan.textContent='请至少选择一个模型';return}if(startBtn._abort){startBtn._abort.abort();return}const controller=new AbortController();startBtn._abort=controller;startBtn.textContent='停止测试';cbs.forEach(c=>c.disabled=true);resultBox.innerHTML='';const summary=document.createElement('div');summary.setAttribute('role','status');summary.style.fontWeight='600';resultBox.append(summary);const results=selected.map(m=>({model:m,state:'pending',ms:0,ttfb:0,msg:''}));const rows=results.map(r=>{const row=document.createElement('div');row.style.cssText='padding:3px 0;font-size:13px;overflow-wrap:anywhere';resultBox.append(row);return row});const renderRow=(i)=>{const r=results[i],row=rows[i];const map={pending:['…','测试中',''],ok:['✓','可用','var(--green)'],fail:['✗','不可用','var(--red)'],limited:['!','受限','var(--orange)'],stopped:['–','已停止','']};const s=map[r.state]||map.fail;row.innerHTML='<span style="color:'+s[2]+'">'+s[0]+' '+s[1]+'</span> · '+esc(r.model)+(r.ms?' · '+r.ms+' ms':'')+(r.ttfb?' (首字节 '+r.ttfb+' ms)':'')+(r.msg?' · '+esc(r.msg):'')};results.forEach((_,i)=>renderRow(i));let done=0;const updateSummary=(final)=>{const ok=results.filter(r=>r.state==='ok').length;summary.textContent=(final?(controller.signal.aborted?'测试已停止':'测试完成'):'测试中 '+done+'/'+selected.length)+' · '+proxyLabel(exit)+'：可用 '+ok+' / '+selected.length};updateSummary(false);let next=0;const worker=async()=>{while(next<results.length){const i=next++,r=results[i];if(controller.signal.aborted){r.state='stopped'}else{renderRow(i);const req=new AbortController(),stop=()=>req.abort();controller.signal.addEventListener('abort',stop);const timer=setTimeout(stop,65000);try{const resp=await fetch('/api/upstream/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:baseURL,api_key:apiKey,api_type:apiType,model:r.model,token_limit_parameter:tokenParam,proxy:exit}),signal:req.signal});if(resp.redirected){controller.abort();throw new Error('登录已过期')}if(!resp.ok)throw new Error((await resp.text()).trim());const d=await resp.json();r.ms=d.latency_ms||0;r.ttfb=d.ttfb_ms||0;if(d.success){r.state='ok'}else if(d.key_status==='limited'){r.state='limited';r.msg=d.error||''}else{r.state='fail';r.msg=d.error||''}}catch(e){if(e.name==='AbortError'&&controller.signal.aborted)r.state='stopped';else{r.state='fail';r.msg=e.name==='AbortError'?'请求超时':e.message}}finally{clearTimeout(timer);controller.signal.removeEventListener('abort',stop)}}done++;renderRow(i);updateSummary(false)}};try{await Promise.all(Array.from({length:selected.length},worker))}finally{startBtn._abort=null;startBtn.textContent='重新测试';cbs.forEach(c=>c.disabled=false);updateSummary(true);const sorted=results.filter(r=>r.state==='ok').sort((a,b)=>a.ms-b.ms);if(sorted.length){const sortDiv=document.createElement('div');sortDiv.style.cssText='margin-top:8px;padding:8px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:13px;line-height:1.7';sortDiv.innerHTML='<b>可用模型（按延迟排序）：</b><br>'+sorted.map((r,i)=>(i+1)+'. '+esc(r.model)+' — '+r.ms+' ms'+(r.ttfb?' (首字节 '+r.ttfb+' ms)':'')).join('<br>');resultBox.append(sortDiv)}}}}
 function buildModelListByUpstreamFromCustomModels(){const grouped={};Object.keys(upstreamData).forEach(name=>{const arr=(upstreamData[name]&&Array.isArray(upstreamData[name].custom_models))?upstreamData[name].custom_models:(typeof (upstreamData[name]||{}).custom_models==='string'?(upstreamData[name].custom_models.split(',').map(s=>s.trim()).filter(Boolean)):[]);grouped[name]=Array.from(new Set(arr)).sort()});return grouped}
-function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||'',multimodal_model:raw.multimodal_model||'',multimodal_upstream:raw.multimodal_upstream||'',multimodal_socks5_proxy:raw.multimodal_socks5_proxy||''}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:'',multimodal_model:'',multimodal_upstream:'',multimodal_socks5_proxy:''}}});aliasData=next}
+function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||''}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:''}}});aliasData=next}
 function normalizeUpstreamData(cfg){upstreamData=cfg.upstreams||{}}
 async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();aliasData=cfg.model_alias||{};normalizeAliasData();effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];normalizeUpstreamData(cfg);modelListByUpstream=buildModelListByUpstreamFromCustomModels()
 renderUpstreamTable();renderAliasTable();renderEffortTable();renderSocks5Table();setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
 function renderUpstreamTable(){const list=document.getElementById('upstreamList');const names=Object.keys(upstreamData).sort();list.innerHTML=names.length?names.map(name=>upstreamCardHtml(name,upstreamData[name],false)).join(''):'<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';}
 function addUpstreamRow(){collectUpstreams();const list=document.getElementById('upstreamList');const empty=list.querySelector('.upstream-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',upstreamCardHtml('',{api_type:'openai'},true));const cards=list.querySelectorAll('.upstream-item');const input=cards.length?cards[cards.length-1].querySelector('[data-field="name"]'):null;if(input)input.focus()}
 function delUpstream(btn){collectAliases();const card=btn.closest('.upstream-item');if(card)card.remove();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();const list=document.getElementById('upstreamList');if(!list.querySelector('.upstream-item'))list.innerHTML='<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';renderAliasTable()}
-function collectUpstreams(){const r={};document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!name||!baseURL)return;const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const reasoningFormat=(card.querySelector('[data-field="responses_reasoning_format"]')||{}).value||'';const up={base_url:baseURL,api_type:apiType};if(apiKey)up.api_key=apiKey;if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);if(apiType==='openai-responses'&&reasoningFormat)up.responses_reasoning_format=reasoningFormat;r[name]=up;card.dataset.originalName=name});upstreamData=r;return r}
-function updateUpstreamCardSummary(el){const card=el.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value||'';card.querySelector('.upstream-summary-name').textContent=name||'未命名上游';card.querySelector('.upstream-summary-url').textContent=baseURL||'尚未配置 Base URL';card.querySelector('.upstream-type-badge').textContent=upstreamTypeLabel(apiType);card.querySelector('.upstream-summary-meta').textContent=nonEmptyLineCount(apiKey)+' Key · '+customModelCount(customRaw)+' 模型'}
-function onUpstreamTypeChange(sel){const card=sel.closest('.upstream-item');const field=card?card.querySelector('.responses-format-field'):null;if(field)field.style.display=sel.value==='openai-responses'?'':'none';updateUpstreamCardSummary(sel)}
+function collectUpstreams(){const r={};document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!name||!baseURL)return;const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const reasoningFormat=(card.querySelector('[data-field="responses_reasoning_format"]')||{}).value||'';const up={base_url:baseURL,api_type:apiType};if(apiKey)up.api_key=apiKey;if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);if(apiType==='openai-responses'&&reasoningFormat)up.responses_reasoning_format=reasoningFormat;const acCb=card.querySelector('[data-field="disable_anthropic_auto_cache"]');if(acCb&&acCb.checked)up.disable_anthropic_auto_cache=true;r[name]=up;card.dataset.originalName=name});upstreamData=r;return r}
+function updateUpstreamCardSummary(el){const card=el.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value||'';card.querySelector('.upstream-summary-name').textContent=name||'未命名上游';card.querySelector('.upstream-summary-url').textContent=baseURL||'尚未配置 Base URL';card.querySelector('.upstream-type-badge').textContent=upstreamTypeLabel(apiType);card.querySelector('.upstream-summary-meta').textContent=nonEmptyLineCount(apiKey)+' Key · '+customModelCount(customRaw)+' 模型';const testSel=card.querySelector('[data-field="model_test"]');if(testSel&&el.dataset.field==='custom_models')refreshTestModels(testSel)}
+function onUpstreamTypeChange(sel){const card=sel.closest('.upstream-item');const field=card?card.querySelector('.responses-format-field'):null;if(field)field.style.display=sel.value==='openai-responses'?'':'none';const acf=card?card.querySelector('.auto-cache-field'):null;if(acf)acf.style.display=sel.value==='anthropic'?'':'none';updateUpstreamCardSummary(sel)}
 function syncUpstreamOptions(){collectAliases();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();renderAliasTable()}function fetchUpstreamModels(btn){const card=btn.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!baseURL){alert('请先填写 Base URL');return}const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const input=card.querySelector('[data-field="custom_models"]');const body={base_url:baseURL,api_type:apiType};if(apiKey)body.api_key=apiKey;const orig=btn.textContent;btn.disabled=true;btn.textContent='获取中…';fetch('/api/upstream/models?name='+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>{if(!r.ok){return r.text().then(t=>{throw new Error(t||('HTTP '+r.status))})}return r.json()}).then(d=>{const arr=Array.isArray(d.models)?d.models:[];if(arr.length===0){alert('上游未返回任何模型');return}input.value=arr.join(', ');updateUpstreamCardSummary(input);syncUpstreamOptions();btn.textContent='已填充 '+arr.length+' 个'}).catch(e=>{alert('获取失败: '+(e&&e.message?e.message:e))}).finally(()=>{btn.disabled=false;btn.textContent=orig})}
 
 function modelsForUpstream(name){const resolved=(name||'').trim();return modelListByUpstream[resolved]||[]}
 function upstreamSelectHtml(selected){const names=Object.keys(upstreamData).sort();if(names.length===0)return '<select data-field="upstream" class="m-select" disabled><option value="">（未配置上游）</option></select>';let h='<select data-field="upstream" class="m-select" onchange="onAliasUpstreamChange(this)"><option value="">-- 选择上游 --</option>';for(const name of names){h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
 function modelSelectHtml(selected,upstreamName){if(!upstreamName)return '<select data-field="val" class="m-select" disabled><option value="">-- 选择模型 --</option></select>';const models=modelsForUpstream(upstreamName);if(models.length===0)return '<select data-field="val" class="m-select" disabled><option value="">（未配置模型）</option></select>';let h='<select data-field="val" class="m-select"><option value="">-- 选择模型 --</option>';let found=!selected;for(const m of models){if(selected===m)found=true;h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (自定义)</option>';h+='</select>';return h}
-function socks5SelectHtml(selected){let h='<select data-field="socks5_proxy" class="m-select"><option value="">直连</option>';let found=!selected;for(const p of socks5Data){if(!p||!p.addr)continue;const addr=String(p.addr).trim();if(!addr)continue;if(selected===addr)found=true;const label=p.name?String(p.name)+' ('+addr+')':addr;h+='<option value="'+esc(addr)+'"'+(selected===addr?' selected':'')+'>'+esc(label)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (已失效)</option>';h+='</select>';return h}
-// 多模态模型的下拉：data-field 用 mm_val，模型从 data-mm-upstream 所选上游拉取
-function mmSelectHtml(selected,upstreamName){if(!upstreamName)return '<select data-field="mm_val" class="m-select" disabled><option value="">-- 选择模型 --</option></select>';const models=modelsForUpstream(upstreamName);let h='<select data-field="mm_val" class="m-select"><option value="">-- 选择模型 --</option>';let found=!selected;for(const m of models){if(selected===m)found=true;h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (自定义)</option>';h+='</select>';return h}
-// 多模态上游下拉（data-field=mm_upstream），切换时刷新同行的 mm_val 模型列表
-function upstreamSelectHtmlMm(selected){const names=Object.keys(upstreamData).sort();if(names.length===0)return '<select data-field="mm_upstream" class="m-select" disabled><option value="">-- 选择上游 --</option></select>';let h='<select data-field="mm_upstream" class="m-select" onchange="onMmUpstreamChange(this)"><option value="">-- 选择上游 --</option>';let found=!selected;for(const name of names){if(selected===name)found=true;h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
-// 多模态独立代理下拉
-function socks5SelectHtmlMm(selected){let h='<select data-field="mm_socks5_proxy" class="m-select"><option value="">直连</option>';let found=!selected;for(const p of socks5Data){if(!p||!p.addr)continue;const addr=String(p.addr).trim();if(!addr)continue;if(selected===addr)found=true;const label=p.name?String(p.name)+' ('+addr+')':addr;h+='<option value="'+esc(addr)+'"'+(selected===addr?' selected':'')+'>'+esc(label)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (已失效)</option>';h+='</select>';return h}
-// 多模态上游变化时刷新多模态模型列表
-function onMmUpstreamChange(sel){const row=sel.closest('tr');const curVal=(row.querySelector('[data-field="mm_val"]')||{}).value?.trim()||'';const mmSel=row.querySelector('[data-field="mm_val"]');if(mmSel){const mmUp=sel.value;const newSel=document.createElement('span');newSel.innerHTML=mmSelectHtml(curVal,mmUp);const replaced=mmSel.closest('span');if(replaced){replaced.replaceWith(newSel.firstChild)}else{mmSel.outerHTML=newSel.innerHTML}}}
-function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>';return}const sortedUpstreams=Object.keys(upstreamData).sort();const aliasUp=sortedUpstreams[0]||'';tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:'',upstream:'',socks5_proxy:'',multimodal_model:'',multimodal_upstream:'',multimodal_socks5_proxy:''};const upName=entry.upstream||aliasUp;const mmUpName=entry.multimodal_upstream||upName;const mmUpSel=entry.multimodal_upstream||'';return '<tr><td rowspan="2"><input value="'+esc(k)+'" data-field="key"></td><td data-model-cell="1"><span style="font-size:10px;color:var(--text-ter)">主上游</span><br>'+upstreamSelectHtml(upName)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主模型</span><br>'+modelSelectHtml(entry.target_model||'',upName)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主代理出口</span><br>'+socks5SelectHtml(entry.socks5_proxy||'')+'</td><td rowspan="2"><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr><tr><td data-mm-cell="1"><span style="font-size:10px;color:var(--text-ter)">多模态上游</span><br>'+upstreamSelectHtmlMm(mmUpSel)+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态模型</span><br>'+mmSelectHtml(entry.multimodal_model||'',mmUpName)+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态代理</span><br>'+socks5SelectHtmlMm(entry.multimodal_socks5_proxy||'')+'</td></tr>'}).join('')}
+// Alias proxy dropdowns use proxyRef as the value. A legacy addr-only or name reference is mapped to its
+// proxy (same lookup order as Go findSocks5Proxy) so it is not shown as invalid.
+function socks5ProxyOptionsHtml(field,selected){const list=socks5Data.filter(p=>p&&p.addr&&String(p.addr).trim());const ref=String(selected||'').trim();const match=ref&&(list.find(p=>proxyRef(p)===ref)||list.find(p=>p.addr===ref)||list.find(p=>p.name&&p.name===ref));const cur=match?proxyRef(match):ref;let h='<select data-field="'+field+'" class="m-select"><option value="">直连</option>';for(const p of list){const r=proxyRef(p);h+='<option value="'+esc(r)+'"'+(cur===r?' selected':'')+'>'+esc(proxyLabel(p))+'</option>'}if(ref&&!match)h+='<option value="'+esc(ref)+'" selected>'+esc(ref)+' (已失效)</option>';h+='</select>';return h}
+function socks5SelectHtml(selected){return socks5ProxyOptionsHtml('socks5_proxy',selected)}
+function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>';return}const sortedUpstreams=Object.keys(upstreamData).sort();const aliasUp=sortedUpstreams[0]||'';tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:'',upstream:'',socks5_proxy:''};const upName=entry.upstream||aliasUp;return '<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+upstreamSelectHtml(upName)+'</td><td>'+modelSelectHtml(entry.target_model||'',upName)+'</td><td>'+socks5SelectHtml(entry.socks5_proxy||'')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>'}).join('')}
 function onAliasUpstreamChange(sel){const row=sel.closest('tr');const curVal=(row.querySelector('[data-field="val"]')||{}).value?.trim()||'';const vSel=row.querySelector('[data-field="val"]');if(vSel){const newSel=document.createElement('span');newSel.innerHTML=modelSelectHtml(curVal,sel.value);const replaced=vSel.closest('span');if(replaced){replaced.replaceWith(newSel.firstChild)}else{vSel.outerHTML=newSel.innerHTML}}}
-function addAliasRow(){collectUpstreams();collectSocks5();const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.insertAdjacentHTML('beforeend','<tr><td rowspan="2"><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td data-model-cell="1"><span style="font-size:10px;color:var(--text-ter)">主上游</span><br>'+upstreamSelectHtml(defaultUp)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主模型</span><br>'+modelSelectHtml('', defaultUp)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主代理出口</span><br>'+socks5SelectHtml('')+'</td><td rowspan="2"><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr><tr><td data-mm-cell="1"><span style="font-size:10px;color:var(--text-ter)">多模态上游</span><br>'+upstreamSelectHtmlMm('')+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态模型</span><br>'+mmSelectHtml('','')+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态代理</span><br>'+socks5SelectHtmlMm('')+'</td></tr>')}
-function delAlias(btn){const row=btn.closest('tr');const mmRow=row.nextElementSibling;const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(mmRow&&mmRow.querySelector('[data-field="mm_val"]'))mmRow.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>'}
-function collectAliases(){const r={};const rows=document.querySelectorAll('#aliasTable tbody tr');for(let i=0;i<rows.length;i++){const tr=rows[i];const k=tr.querySelector('[data-field="key"]');if(!k||!k.value.trim())continue;const u=tr.querySelector('[data-field="upstream"]'),v=tr.querySelector('[data-field="val"]'),p=tr.querySelector('[data-field="socks5_proxy"]');const mmRow=rows[i+1];const mm=mmRow?mmRow.querySelector('[data-field="mm_val"]'):null,mmup=mmRow?mmRow.querySelector('[data-field="mm_upstream"]'):null,mmsk=mmRow?mmRow.querySelector('[data-field="mm_socks5_proxy"]'):null;if(!mmRow)continue;const aliasKey=k.value.trim();const targetModel=v?v.value.trim():'';const upstreamName=u?u.value.trim():'';const socks5Proxy=p?p.value.trim():'';const multimodalModel=mm?mm.value.trim():'';let mmUpstream=mmup?mmup.value.trim():'';const mmProxy=mmsk?mmsk.value.trim():'';if(targetModel||upstreamName||socks5Proxy||multimodalModel||mmUpstream||mmProxy)r[aliasKey]={target_model:targetModel,upstream:upstreamName,socks5_proxy:socks5Proxy,multimodal_model:multimodalModel,multimodal_upstream:mmUpstream,multimodal_socks5_proxy:mmProxy};i++}aliasData=r;return r}
+function addAliasRow(){collectUpstreams();collectSocks5();const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+upstreamSelectHtml(defaultUp)+'</td><td>'+modelSelectHtml('', defaultUp)+'</td><td>'+socks5SelectHtml('')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
+function delAlias(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>'}
+function collectAliases(){const r={};const rows=document.querySelectorAll('#aliasTable tbody tr');for(let i=0;i<rows.length;i++){const tr=rows[i];const k=tr.querySelector('[data-field="key"]');if(!k||!k.value.trim())continue;const u=tr.querySelector('[data-field="upstream"]'),v=tr.querySelector('[data-field="val"]'),p=tr.querySelector('[data-field="socks5_proxy"]');const aliasKey=k.value.trim();const targetModel=v?v.value.trim():'';const upstreamName=u?u.value.trim():'';const socks5Proxy=p?p.value.trim():'';if(targetModel||upstreamName||socks5Proxy)r[aliasKey]={target_model:targetModel,upstream:upstreamName,socks5_proxy:socks5Proxy}}aliasData=r;return r}
 
 
 
@@ -7921,16 +8548,24 @@ function renderEffortTable(){const list=document.getElementById('effortList');co
 function addEffortRow(){collectEfforts();const details=document.getElementById('reasoningEffortDetails');details.open=true;const list=document.getElementById('effortList');const empty=list.querySelector('.effort-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',effortRowHtml('',''));const rows=list.querySelectorAll('.effort-row');const input=rows.length?rows[rows.length-1].querySelector('[data-field="key"]'):null;if(input)input.focus()}
 function delEffort(btn){const row=btn.closest('.effort-row');if(row)row.remove();collectEfforts();renderEffortTable()}
 function collectEfforts(){const r={};document.querySelectorAll('#effortList .effort-row').forEach(row=>{const k=row.querySelector('[data-field="key"]'),v=row.querySelector('[data-field="val"]');if(k&&k.value.trim())r[k.value.trim()]=v?v.value.trim():''});effortData=r;updateEffortSummary();return r}
-function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name" onchange="syncSocks5AliasOptions()"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="例如: 127.0.0.1:1080" onchange="syncSocks5AliasOptions()"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('')}
-function addSocks5Row(){collectSocks5();socks5Data.push({addr:'',name:''});renderSocks5Table()}
-function delSocks5(i){collectAliases();const rows=document.querySelectorAll('#socks5Table tbody tr');if(rows[i])rows[i].remove();collectSocks5();renderSocks5Table();renderAliasTable()}
-function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
+function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name" onchange="syncSocks5AliasOptions()"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="例如: 127.0.0.1:1080" onchange="syncSocks5AliasOptions()"></td><td><input value="'+esc(p.username||'')+'" data-field="username" onchange="syncSocks5AliasOptions()"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('')}
+// Row edits work on the table snapshot including blank rows, so a just-added empty row survives and
+// deleting the last row really empties the list.
+function readSocks5Rows(){return [...document.querySelectorAll('#socks5Table tbody tr')].filter(tr=>tr.querySelector('[data-field="addr"]')).map(tr=>{const f=n=>(tr.querySelector('[data-field="'+n+'"]')||{}).value?.trim()||'';return {addr:f('addr'),name:f('name'),username:f('username'),password:f('password')}})}
+function addSocks5Row(){const rows=document.querySelector('#socks5Table tbody [data-field="addr"]')?readSocks5Rows():socks5Data.slice();rows.push({addr:'',name:''});socks5Data=rows;renderSocks5Table();socks5Data=rows.filter(p=>p.addr)}
+function delSocks5(i){collectAliases();const rows=document.querySelector('#socks5Table tbody [data-field="addr"]')?readSocks5Rows():socks5Data.slice();rows.splice(i,1);socks5Data=rows;renderSocks5Table();socks5Data=rows.filter(p=>p.addr);renderAliasTable()}
+// Reads the SOCKS5 table without side effects. Returns null when the table has no editable rows yet
+// (not rendered, or showing the "暂无代理配置" placeholder) so callers keep socks5Data as loaded.
+function readSocks5Table(){const rows=[...document.querySelectorAll('#socks5Table tbody tr')].filter(tr=>tr.querySelector('[data-field="addr"]'));if(!rows.length)return null;const r=[];rows.forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});return r}
+// Syncs socks5Data from the table. With no editable rows the table is either not rendered yet or
+// genuinely empty; both mean "use socks5Data", which renderSocks5Table keeps in step with the table.
+function collectSocks5(){const r=readSocks5Table();if(r)socks5Data=r;else if(document.querySelector('#socks5Table tbody .empty-hint'))socks5Data=[];return socks5Data}
 function syncSocks5AliasOptions(){collectAliases();collectSocks5();renderAliasTable()}
-async function saveConfig(section){const aliasRows=[...document.querySelectorAll('#aliasTable tbody tr')];if(aliasRows.some(tr=>{const k=tr.querySelector('[data-field="key"]');return k&&!k.value.trim()})){showToast('存在别名（请求名）为空的行，请填写后再保存','error');return}const dupCheck={};for(const tr of aliasRows){const k=tr.querySelector('[data-field="key"]');const key=k?k.value.trim():'';if(key){if(dupCheck[key]){showToast('存在重复的别名「'+key+'」，请修改后再保存','error');return}dupCheck[key]=true}}collectAliases();collectUpstreams();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,upstreams:upstreamData};const label=section||'配置';try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast(label+'已保存','success');loadConfig()}catch(e){showToast(label+'保存失败: '+e.message,'error')}}
+async function saveConfig(section){const aliasRows=[...document.querySelectorAll('#aliasTable tbody tr')];if(aliasRows.some(tr=>{const k=tr.querySelector('[data-field="key"]');return k&&!k.value.trim()})){showToast('存在别名（请求名）为空的行，请填写后再保存','error');return}const dupCheck={};for(const tr of aliasRows){const k=tr.querySelector('[data-field="key"]');const key=k?k.value.trim():'';if(key){if(dupCheck[key]){showToast('存在重复的别名「'+key+'」，请修改后再保存','error');return}dupCheck[key]=true}}const proxyRows=[...document.querySelectorAll('#socks5Table tbody tr')].filter(tr=>tr.querySelector('[data-field="addr"]'));const proxySeen={};for(let i=0;i<proxyRows.length;i++){const f=n=>((proxyRows[i].querySelector('[data-field="'+n+'"]')||{}).value||'').trim();const addr=f('addr');if(!addr){if(f('name')||f('username')||f('password')){showToast('SOCKS5 代理第 '+(i+1)+' 行未填写地址，请填写或删除该行','error');return}continue}const ref=proxyRef({addr,username:f('username')});if(proxySeen[ref]){showToast('SOCKS5 代理第 '+(i+1)+' 行与第 '+proxySeen[ref]+' 行的地址和用户名都相同（'+ref+'），同一地址的多个代理需要使用不同的用户名','error');return}proxySeen[ref]=i+1}collectAliases();collectUpstreams();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,upstreams:upstreamData};const label=section||'配置';try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast(label+'已保存','success');loadConfig()}catch(e){showToast(label+'保存失败: '+e.message,'error')}}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
-async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);const dm=d.daily?d.daily.models||{}:{};const dk=Object.keys(dm);let h='';if(d.daily&&d.daily.date){h+='<div style="margin-bottom:16px;padding:10px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:13px">📊 今日统计 ('+esc(d.daily.date)+')：请求 '+fmt(d.daily.total_requests)+' 次</div>'}if(dk.length>0){h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">今日模型用量</h3><table class="tbl" id="dailyTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';let dr=0,dp=0,dc=0,dt=0;for(const k of dk){const m=dm[k];if(!m)continue;h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';dr+=m.request_count;dp+=m.prompt_tokens;dc+=m.completion_tokens;dt+=m.total_tokens}h+='<tr style="font-weight:600"><td>今日合计</td><td>'+fmt(dr)+'</td><td>'+fmt(dp)+'</td><td>'+fmt(dc)+'</td><td>'+fmt(dt)+'</td></tr>';h+='</tbody></table><hr style="border:none;border-top:1px solid var(--border);margin:20px 0">'}h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">累计统计</h3><table class="tbl" id="statsTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600"><td>累计总计</td><td>'+fmt(tr)+'</td><td>'+fmt(pt)+'</td><td>'+fmt(ct)+'</td><td>'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
+async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const dm=d.daily?d.daily.models||{}:{};const dk=Object.keys(dm);const hist=d.history||[];let h='';const cols='<th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th>';function row(k,m){return '<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>'}function sumRow(label,models){let r=0,p=0,c=0,t=0;for(const k in models){const m=models[k];if(!m)continue;r+=m.request_count;p+=m.prompt_tokens;c+=m.completion_tokens;t+=m.total_tokens}return '<tr style="font-weight:600"><td>'+label+'</td><td>'+fmt(r)+'</td><td>'+fmt(p)+'</td><td>'+fmt(c)+'</td><td>'+fmt(t)+'</td></tr>'}if(d.daily&&d.daily.date){h+='<div style="margin-bottom:16px;padding:10px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:13px">📊 今日统计 ('+esc(d.daily.date)+')：请求 '+fmt(d.daily.total_requests)+' 次</div>'}if(dk.length>0){h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">今日模型用量</h3><table class="tbl"><thead><tr>'+cols+'</tr></thead><tbody>';for(const k of dk){if(dm[k])h+=row(k,dm[k])}h+=sumRow('今日合计',dm);h+='</tbody></table>'}if(hist.length>0){h+='<hr style="border:none;border-top:1px solid var(--border);margin:20px 0">';const recent=hist.slice(0,7);h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">最近 '+recent.length+' 天</h3><table class="tbl"><thead><tr><th>日期</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th></tr></thead><tbody>';for(const day of recent){let r=0,p=0,c=0;for(const k in day.models||{}){const m=day.models[k];if(!m)continue;r+=m.request_count;p+=m.prompt_tokens;c+=m.completion_tokens}h+='<tr><td>'+esc(day.date)+'</td><td>'+fmt(r)+'</td><td>'+fmt(p)+'</td><td>'+fmt(c)+'</td></tr>'}h+='</tbody></table>';if(hist.length>7){const all={};for(const day of hist){for(const k in day.models||{}){const m=day.models[k];if(!m)continue;if(!all[k])all[k]={request_count:0,prompt_tokens:0,completion_tokens:0,total_tokens:0};all[k].request_count+=m.request_count;all[k].prompt_tokens+=m.prompt_tokens;all[k].completion_tokens+=m.completion_tokens;all[k].total_tokens+=m.total_tokens}}h+='<h3 style="font-size:14px;font-weight:600;margin:16px 0 8px">近 '+hist.length+' 天模型汇总</h3><table class="tbl"><thead><tr>'+cols+'</tr></thead><tbody>';for(const k of Object.keys(all).sort())h+=row(k,all[k]);h+=sumRow('合计',all);h+='</tbody></table>'}}if(!dk.length&&!hist.length)h='<div class="empty-hint">暂无数据</div>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
 function fmt(n){return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')}window.onload=function(){loadConfig();loadStats()};setInterval(loadStats,5000);document.addEventListener('visibilitychange',function(){if(!document.hidden)loadStats()});
 </script>
 </body>
@@ -7977,6 +8612,7 @@ func main() {
 	http.HandleFunc("/api/config", requireAuth(adminConfigHandler))
 	http.HandleFunc("/api/stats", requireAuth(adminStatsHandler))
 	http.HandleFunc("/api/reload", requireAuth(reloadHandler))
+	http.HandleFunc("/api/upstream/test", requireAuth(upstreamModelTestHandler))
 	http.HandleFunc("/api/upstream/models", requireAuth(upstreamModelsHandler))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
