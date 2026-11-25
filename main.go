@@ -4501,7 +4501,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		defer upResp.Close()
 		// 如果上游是 Anthropic，需要将 Anthropic SSE 流转为 OpenAI Chat SSE 格式
 		if upstream != nil && upstream.APIType == UpstreamAnthropic {
-			anthropicStreamToChatHandler(w, upResp, req.Model)
+			// chat 入口是唯一记账方，这里记统计
+			anthropicStreamToChatHandler(w, upResp, req.Model, true)
 			return
 		}
 		if upstream != nil && upstream.APIType == UpstreamResponses {
@@ -5808,7 +5809,9 @@ func (p *pipeResponseWriter) Flush() {
 }
 
 // anthropicStreamToChatHandler 将上游 Anthropic SSE 流实时转为 OpenAI Chat SSE 格式并写入客户端
-func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser, model string) {
+// recordUsage 为 false 时只做 Anthropic→Chat 流转换、不记统计，供外层 handler
+// （如 responsesStreamHandler）独自记账，避免 responses→anthropic 流式路径双计。
+func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser, model string, recordUsage bool) {
 	// 同 anthropicStreamHandler：作为 pipe 读端时必须关闭，否则写端 goroutine 泄漏
 	defer respBody.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -5832,7 +5835,7 @@ func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser,
 	fullUsage := map[string]any{}
 
 	defer func() {
-		if len(fullUsage) > 0 {
+		if recordUsage && len(fullUsage) > 0 {
 			recordUsageFromMap(model, fullUsage)
 		}
 	}()
@@ -6856,7 +6859,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			go func() {
 				defer pw.Close()
 				chatW := &pipeResponseWriter{w: pw}
-				anthropicStreamToChatHandler(chatW, upResp, chatReq.Model)
+				// 外层 responsesStreamHandler 记账，这里不记，避免双计
+				anthropicStreamToChatHandler(chatW, upResp, chatReq.Model, false)
 			}()
 			chatResp := &http.Response{
 				StatusCode: status,
