@@ -1050,6 +1050,7 @@ type ResponsesTool struct {
 	Name         string          `json:"name,omitempty"`
 	Description  string          `json:"description,omitempty"`
 	Parameters   map[string]any  `json:"parameters,omitempty"`
+	Format       map[string]any  `json:"format,omitempty"`
 	Function     *ToolFunction   `json:"function,omitempty"`
 	Tools        []ResponsesTool `json:"tools,omitempty"`
 	CacheControl any             `json:"cache_control,omitempty"`
@@ -1058,7 +1059,17 @@ type ResponsesTool struct {
 type ResponseToolNameMapping struct {
 	Namespace string
 	Name      string
+	// Custom 表示该工具在 Responses 里是 custom（自由文本）工具，发给 chat 上游时被编码成
+	// 只有一个字符串参数 customToolInputArg 的 function；响应方向要还原成 custom_tool_call。
+	Custom bool
 }
+
+// customToolInputArg 是 custom 工具编码成 function 后唯一的字符串参数名。
+const customToolInputArg = "input"
+
+// defaultResponsesToolNamespace 是 Codex 的默认命名空间，展平时不加前缀（与 new-api 一致），
+// 这样 functions.exec 发给上游的名字就是 exec，而不是 functions__exec。
+const defaultResponsesToolNamespace = "functions"
 
 type ReasonEffort struct {
 	Effort string `json:"effort,omitempty"`
@@ -3255,6 +3266,11 @@ func copyClientHeaders(dst http.Header, src http.Header) {
 		"content-length": {},
 		"content-type":   {},
 		"accept":         {},
+		// 内容编码必须交给 Go transport 自己协商：调用方一旦手动设置 Accept-Encoding，
+		// transport 就不再自动解压。Codex 带 "zstd,gzip" 透传到会压缩流的上游（如 DeepSeek 官方），
+		// 网关拿到的是压缩字节，找不到任何 "data: " 行，表现为 ttfb 正常、0 个 chunk、
+		// stream_ended_early。
+		"accept-encoding": {},
 	}
 	for _, name := range hopByHopHeaders {
 		blocked[strings.ToLower(name)] = struct{}{}
@@ -6176,7 +6192,12 @@ func responsesInputToMessages(input any, instructions string) []Message {
 			case map[string]any:
 				itemType, _ := elem["type"].(string)
 				switch itemType {
-				case "function_call", "tool_call":
+				case "additional_tools":
+					// 工具目录由 recoverResponsesInputTools 恢复并放进 chat 的 tools，
+					// 不能再当文本消息发给上游（实测会变成 7 万字符的 JSON 文本，模型照着
+					// 文本里的工具说明自己输出 DSML 调用格式）。
+					continue
+				case "function_call", "tool_call", "custom_tool_call":
 					if pendingAssistant != nil {
 						if existing, ok := pendingAssistant.Content.(string); ok && strings.TrimSpace(existing) != "" && len(pendingAssistant.ToolCalls) == 0 {
 							flushPendingAssistant()
@@ -6186,7 +6207,7 @@ func responsesInputToMessages(input any, instructions string) []Message {
 						msg := ensurePendingAssistant()
 						msg.ToolCalls = append(msg.ToolCalls, tc)
 					}
-				case "function_call_output", "tool_result":
+				case "function_call_output", "tool_result", "custom_tool_call_output":
 					// 不立即 flush：同一 assistant turn 内可能有多个 function_call
 					// （codex 串行调工具时是 CO-CO 交替排布），立即 flush 会把它们
 					// 拆成多条 assistant 消息，导致后续消息丢失 reasoning_content
@@ -6287,6 +6308,24 @@ func responsesToolCallFromItem(elem map[string]any) (ToolCall, bool) {
 			b, _ := json.Marshal(rawArgs)
 			args = string(b)
 		}
+	}
+	// custom_tool_call：input 是裸字符串，chat 上游里该工具被编码成单参数 function，
+	// 历史里的调用也要包成同样的 {"input": "..."}，否则模型看到的调用与定义不一致。
+	if t, _ := elem["type"].(string); t == "custom_tool_call" {
+		var input string
+		switch v := elem["input"].(type) {
+		case string:
+			input = v
+		case nil:
+		default:
+			b, _ := json.Marshal(v)
+			input = string(b)
+		}
+		b, _ := json.Marshal(map[string]string{customToolInputArg: input})
+		args = string(b)
+	}
+	if ns, _ := elem["namespace"].(string); ns != "" && name != "" {
+		name = flattenNamespaceToolName(ns, name)
 	}
 	if name == "" {
 		if tu, ok := elem["tool_use"].(map[string]any); ok {
@@ -6427,32 +6466,230 @@ func convertChatToolChoiceToResponses(choice any) any {
 	}
 }
 
+// ======================== Codex Responses Lite 工具目录 ========================
+
+var (
+	reToolsRemovedNotice      = regexp.MustCompile(`(?s)The following tools are no longer available\..*?:\s*\n(.*)`)
+	reNamespacesRemovedNotice = regexp.MustCompile(`(?s)The following namespaces are no longer available\..*?:\s*\n(.*)`)
+)
+
+// parseRemovalList 取出删除通知里 "- name" 逐行列出的名字。
+func parseRemovalList(block string) []string {
+	var names []string
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "-") {
+			// 列表在遇到第一个非列表行时结束，避免把后面的无关文字当工具名
+			if len(names) > 0 {
+				break
+			}
+			continue
+		}
+		if n := strings.TrimSpace(strings.TrimPrefix(line, "-")); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
+// developerItemText 取 input 里 developer/system 消息的纯文本，用来识别工具删除通知。
+func developerItemText(elem map[string]any) string {
+	if t, _ := elem["type"].(string); t != "message" && t != "" {
+		return ""
+	}
+	if r, _ := elem["role"].(string); r != "developer" && r != "system" {
+		return ""
+	}
+	return extractTextFromContentParts(elem["content"])
+}
+
+// recoverResponsesInputTools 实现 Codex Responses Lite 的工具目录恢复：
+// Lite 请求没有顶层 tools，工具作为 type=additional_tools 的 input 项出现，
+// 自 2026-10-19 起默认增量发送，后续请求可能只带新增/变更的定义，也可能完全不带。
+// 按 input 顺序重放：同键覆盖（顶层以 type+name、命名空间内以 namespace+type+name 为键），
+// 遇到 developer 的删除通知则移除对应键或整个命名空间。
+// 返回 (目录, 是否发现 additional_tools)。目录里的顶层工具和命名空间保持首次出现的顺序。
+func recoverResponsesInputTools(input any) ([]ResponsesTool, bool) {
+	items, ok := input.([]any)
+	if !ok {
+		return nil, false
+	}
+	type entry struct {
+		key       string
+		namespace string
+		tool      ResponsesTool
+	}
+	var order []string
+	catalog := map[string]entry{}
+	nsMeta := map[string]ResponsesTool{} // 命名空间自身的 description
+	found := false
+	put := func(namespace string, t ResponsesTool) {
+		key := namespace + "\x00" + t.Type + "\x00" + t.Name
+		if _, exists := catalog[key]; !exists {
+			order = append(order, key)
+		}
+		catalog[key] = entry{key: key, namespace: namespace, tool: t}
+	}
+	remove := func(match func(e entry) bool) {
+		for k, e := range catalog {
+			if match(e) {
+				delete(catalog, k)
+			}
+		}
+	}
+	for _, raw := range items {
+		elem, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := elem["type"].(string); t == "additional_tools" {
+			found = true
+			b, err := json.Marshal(elem["tools"])
+			if err != nil {
+				continue
+			}
+			var defs []ResponsesTool
+			if json.Unmarshal(b, &defs) != nil {
+				continue
+			}
+			for _, d := range defs {
+				if d.Type == "namespace" {
+					ns := strings.TrimSpace(d.Name)
+					nsMeta[ns] = ResponsesTool{Type: "namespace", Name: ns, Description: d.Description}
+					for _, child := range d.Tools {
+						put(ns, child)
+					}
+					continue
+				}
+				put("", d)
+			}
+			continue
+		}
+		text := developerItemText(elem)
+		if text == "" {
+			continue
+		}
+		if m := reNamespacesRemovedNotice.FindStringSubmatch(text); m != nil {
+			for _, ns := range parseRemovalList(m[1]) {
+				remove(func(e entry) bool { return e.namespace == ns })
+			}
+		}
+		if m := reToolsRemovedNotice.FindStringSubmatch(text); m != nil {
+			for _, name := range parseRemovalList(m[1]) {
+				remove(func(e entry) bool { return e.tool.Name == name })
+			}
+		}
+	}
+	if !found {
+		return nil, false
+	}
+	// 重新装配：顶层工具原样，命名空间工具按命名空间聚合
+	var out []ResponsesTool
+	nsIndex := map[string]int{}
+	for _, key := range order {
+		e, ok := catalog[key]
+		if !ok {
+			continue
+		}
+		if e.namespace == "" {
+			out = append(out, e.tool)
+			continue
+		}
+		idx, exists := nsIndex[e.namespace]
+		if !exists {
+			meta := nsMeta[e.namespace]
+			out = append(out, ResponsesTool{Type: "namespace", Name: e.namespace, Description: meta.Description})
+			idx = len(out) - 1
+			nsIndex[e.namespace] = idx
+		}
+		out[idx].Tools = append(out[idx].Tools, e.tool)
+	}
+	return out, true
+}
+
 func convertResponsesToolsWithMappings(tools []ResponsesTool) ([]Tool, map[string]ResponseToolNameMapping) {
 	converted := make([]Tool, 0, len(tools))
 	mappings := map[string]ResponseToolNameMapping{}
+	seen := map[string]bool{}
+	add := func(tool ResponsesTool, namespace string) {
+		var fn ToolFunction
+		var ok bool
+		custom := false
+		switch tool.Type {
+		case "function", "":
+			fn, ok = responsesToolFunction(tool, namespace)
+		case "custom":
+			fn, ok = responsesCustomToolFunction(tool, namespace)
+			custom = true
+		}
+		// 同名工具后者覆盖前者没有意义（chat 上游会拒绝重名），保留先出现的
+		if !ok || seen[fn.Name] {
+			return
+		}
+		seen[fn.Name] = true
+		converted = append(converted, Tool{Type: "function", Function: fn})
+		bare := responseToolName(tool)
+		if namespace != "" || custom || fn.Name != bare {
+			mappings[fn.Name] = ResponseToolNameMapping{Namespace: namespace, Name: bare, Custom: custom}
+		}
+	}
 	for _, tool := range tools {
 		switch tool.Type {
-		case "function":
-			if fn, ok := responsesToolFunction(tool, ""); ok {
-				converted = append(converted, Tool{Type: "function", Function: fn})
-			}
 		case "namespace":
 			namespace := strings.TrimSpace(tool.Name)
 			for _, nested := range tool.Tools {
-				if nested.Type != "function" {
-					continue
-				}
-				if fn, ok := responsesToolFunction(nested, namespace); ok {
-					converted = append(converted, Tool{Type: "function", Function: fn})
-					mappings[fn.Name] = ResponseToolNameMapping{
-						Namespace: namespace,
-						Name:      responseToolName(nested),
-					}
+				add(nested, namespace)
+			}
+		default:
+			// tool_search、web_search 等 chat 上游无法表达的托管工具在 add 里被忽略
+			add(tool, "")
+		}
+	}
+	return converted, mappings
+}
+
+// responsesCustomToolFunction 把 Responses 的 custom（自由文本）工具编码成 chat function：
+// 单个必填字符串参数 input。grammar（如 Codex exec 的 lark 语法）无法结构化传递，
+// 以文字形式追加到描述里，提示模型输出必须符合该语法。
+func responsesCustomToolFunction(tool ResponsesTool, namespace string) (ToolFunction, bool) {
+	name := strings.TrimSpace(tool.Name)
+	if name == "" {
+		return ToolFunction{}, false
+	}
+	parts := []string{}
+	if d := strings.TrimSpace(tool.Description); d != "" {
+		parts = append(parts, d)
+	}
+	parts = append(parts, `This tool takes freeform text. Put the complete raw text in the "`+customToolInputArg+`" argument.`)
+	if tool.Format != nil {
+		if t, _ := tool.Format["type"].(string); t == "grammar" {
+			syntax, _ := tool.Format["syntax"].(string)
+			def, _ := tool.Format["definition"].(string)
+			if strings.TrimSpace(def) != "" {
+				switch syntax {
+				case "lark":
+					parts = append(parts, "The input must match this Lark grammar:\n"+def)
+				case "regex":
+					parts = append(parts, "The input must match this regular expression:\n"+def)
+				default:
+					parts = append(parts, "The input must match this "+syntax+" grammar:\n"+def)
 				}
 			}
 		}
 	}
-	return converted, mappings
+	return ToolFunction{
+		Name:        flattenNamespaceToolName(namespace, name),
+		Description: strings.Join(parts, "\n\n"),
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				customToolInputArg: map[string]any{"type": "string", "description": "Raw input for the tool."},
+			},
+			"required":             []any{customToolInputArg},
+			"additionalProperties": false,
+		},
+		CacheControl: tool.CacheControl,
+	}, true
 }
 
 func responsesToolFunction(tool ResponsesTool, namespace string) (ToolFunction, bool) {
@@ -6492,7 +6729,8 @@ func responseToolName(tool ResponsesTool) string {
 func flattenNamespaceToolName(namespace, toolName string) string {
 	ns := strings.TrimSuffix(strings.TrimSpace(namespace), "__")
 	name := strings.TrimSpace(toolName)
-	if ns == "" {
+	// 默认命名空间不加前缀：Codex 的 functions.exec 对上游就是 exec
+	if ns == "" || ns == defaultResponsesToolNamespace {
 		return name
 	}
 	return ns + "__" + name
@@ -6531,6 +6769,23 @@ func convertResponsesToolChoice(choice any) any {
 }
 
 func responseFunctionCallItem(itemID, status, arguments, callID, name string, mappings map[string]ResponseToolNameMapping) map[string]any {
+	mapping, mapped := responseToolNameMapping(name, mappings)
+	if mapped && mapping.Custom {
+		// custom 工具在 chat 上游里是单参数 function，这里把 {"input":"..."} 拆回裸字符串，
+		// 还原成 Codex 期望的 custom_tool_call。
+		item := map[string]any{
+			"id":      itemID,
+			"type":    "custom_tool_call",
+			"status":  status,
+			"call_id": callID,
+			"name":    mapping.Name,
+			"input":   customToolInputFromArguments(arguments),
+		}
+		if mapping.Namespace != "" {
+			item["namespace"] = mapping.Namespace
+		}
+		return item
+	}
 	item := map[string]any{
 		"id":        itemID,
 		"type":      "function_call",
@@ -6539,11 +6794,32 @@ func responseFunctionCallItem(itemID, status, arguments, callID, name string, ma
 		"call_id":   callID,
 		"name":      name,
 	}
-	if mapping, ok := responseToolNameMapping(name, mappings); ok {
+	if mapped {
 		item["name"] = mapping.Name
 		item["namespace"] = mapping.Namespace
 	}
 	return item
+}
+
+// customToolInputFromArguments 从 chat 工具调用的 JSON 参数里取出 custom 工具的裸输入。
+// 模型偶尔不按 schema 输出（缺 input、给了裸文本），此时尽量保留原文而不是丢掉调用。
+func customToolInputFromArguments(arguments string) string {
+	raw := strings.TrimSpace(arguments)
+	if raw == "" {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return arguments
+	}
+	if v, ok := obj[customToolInputArg]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+	return arguments
 }
 
 func responseToolNameMapping(name string, mappings map[string]ResponseToolNameMapping) (ResponseToolNameMapping, bool) {
@@ -6799,8 +7075,15 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if respReq.TopP != 0 {
 		chatReq.TopP = &respReq.TopP
 	}
-	if len(respReq.Tools) > 0 {
-		chatReq.Tools, toolNameMappings = convertResponsesToolsWithMappings(respReq.Tools)
+	// Codex Responses Lite（gpt-5.6-* / gpt-6.2-* 等）没有顶层 tools，工具目录在
+	// input 的 additional_tools 里（增量发送，需按历史顺序重放恢复）。
+	// 顶层 tools 与 additional_tools 并存时两者合并，顶层在前。
+	allTools := respReq.Tools
+	if recovered, found := recoverResponsesInputTools(respReq.Input); found {
+		allTools = append(append([]ResponsesTool{}, respReq.Tools...), recovered...)
+	}
+	if len(allTools) > 0 {
+		chatReq.Tools, toolNameMappings = convertResponsesToolsWithMappings(allTools)
 	}
 	if respReq.ToolChoice != nil {
 		chatReq.ToolChoice = convertResponsesToolChoice(respReq.ToolChoice)
@@ -7065,14 +7348,40 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		}
 		call["arguments"] = normalizedArgs
 		call["done"] = true
-		seq++
-		emitSSEEvent(w, flusher, "response.function_call_arguments.done", map[string]any{
-			"type":            "response.function_call_arguments.done",
-			"sequence_number": seq,
-			"item_id":         itemID,
-			"output_index":    idx,
-			"arguments":       normalizedArgs,
-		})
+		if mp, ok := responseToolNameMapping(name, toolNameMappings); ok && mp.Custom {
+			// custom 工具：流式期间只缓冲参数，结束时从完整 JSON 里取出 input，
+			// 一次性发 delta + done（边流边解析不完整的 JSON 取 input 不可靠）。
+			input := customToolInputFromArguments(normalizedArgs)
+			if input != "" {
+				seq++
+				emitSSEEvent(w, flusher, "response.custom_tool_call_input.delta", map[string]any{
+					"type":            "response.custom_tool_call_input.delta",
+					"sequence_number": seq,
+					"item_id":         itemID,
+					"output_index":    idx,
+					"call_id":         callID,
+					"delta":           input,
+				})
+			}
+			seq++
+			emitSSEEvent(w, flusher, "response.custom_tool_call_input.done", map[string]any{
+				"type":            "response.custom_tool_call_input.done",
+				"sequence_number": seq,
+				"item_id":         itemID,
+				"output_index":    idx,
+				"call_id":         callID,
+				"input":           input,
+			})
+		} else {
+			seq++
+			emitSSEEvent(w, flusher, "response.function_call_arguments.done", map[string]any{
+				"type":            "response.function_call_arguments.done",
+				"sequence_number": seq,
+				"item_id":         itemID,
+				"output_index":    idx,
+				"arguments":       normalizedArgs,
+			})
+		}
 		seq++
 		emitSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
@@ -7262,14 +7571,19 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			}
 			if argDelta, _ := fn["arguments"].(string); argDelta != "" {
 				call["arguments"] = call["arguments"].(string) + argDelta
-				seq++
-				emitSSEEvent(w, flusher, "response.function_call_arguments.delta", map[string]any{
-					"type":            "response.function_call_arguments.delta",
-					"sequence_number": seq,
-					"item_id":         call["item_id"],
-					"output_index":    call["output_index"],
-					"delta":           argDelta,
-				})
+				// custom 工具的参数是 {"input":"..."} 的 JSON 外壳，增量发给客户端没有意义，
+				// 只缓冲，结束时在 emitToolCallDone 里解包后一次性发出。
+				callName, _ := call["name"].(string)
+				if mp, isCustom := responseToolNameMapping(callName, toolNameMappings); !(isCustom && mp.Custom) {
+					seq++
+					emitSSEEvent(w, flusher, "response.function_call_arguments.delta", map[string]any{
+						"type":            "response.function_call_arguments.delta",
+						"sequence_number": seq,
+						"item_id":         call["item_id"],
+						"output_index":    call["output_index"],
+						"delta":           argDelta,
+					})
+				}
 			}
 		}
 
@@ -8513,7 +8827,7 @@ async function checkUpstreamKeys(btn){if(btn._abort){btn._abort.abort();return}c
 function keyErrorGroup(status,code){return (status?'HTTP '+status:'无 HTTP 响应')+(code?' · '+code:'')}
 function removeKeyLines(raw,keys){const drop=new Set(keys);return String(raw||'').split(/\r\n|\r|\n/).filter(line=>!drop.has(line.trim())).join('\n')}
 // Lists failed keys grouped by HTTP status + upstream error code; nothing is removed until the user selects groups. Changes the form only (save to apply), with undo.
-function renderKeyCleanup(card,failed,box){const input=card.querySelector('[data-field=”api_key”]');const groups=Object.keys(failed).sort();if(!input||!groups.length)return;const panel=document.createElement('div');panel.style.cssText='margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:8px';const title=document.createElement('div');title.textContent='按错误类型删除 Key（勾选后删除，只改表单，点击”保存上游”后生效）：';panel.append(title);const boxes=groups.map(g=>{const label=document.createElement('label');label.style.cssText='display:block;margin:4px 0;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.value=g;label.append(cb,' '+g+'（'+failed[g].length+' 个）');panel.append(label);return cb});const actions=document.createElement('div');actions.style.marginTop='6px';const del=document.createElement('button');del.type='button';del.className='btn btn-danger';del.textContent='删除选中的 Key';const note=document.createElement('span');note.style.marginLeft='8px';del.onclick=()=>{const picked=boxes.filter(b=>b.checked&&!b.disabled);if(!picked.length){note.textContent='请先勾选要删除的错误类型';return}const keys=picked.flatMap(b=>failed[b.value]);const before=input.value;const after=removeKeyLines(before,keys);input.value=after;updateUpstreamCardSummary(input);picked.forEach(b=>{b.disabled=true});note.textContent='已从表单删除 '+keys.length+' 个 Key（'+picked.map(b=>b.value).join('、')+'）。';const undo=document.createElement('button');undo.type='button';undo.className='btn btn-secondary';undo.style.marginLeft='8px';undo.textContent='撤销';undo.onclick=()=>{if(input.value!==after){note.textContent='Key 已被修改，无法撤销。';undo.remove();return}input.value=before;updateUpstreamCardSummary(input);picked.forEach(b=>{b.disabled=false});note.textContent='已撤销，恢复 '+keys.length+' 个 Key。';undo.remove()};note.append(undo)};actions.append(del,note);panel.append(actions);box.insertBefore(panel,box.children[1]||null)}
+function renderKeyCleanup(card,failed,box){const input=card.querySelector('[data-field="api_key"]');const groups=Object.keys(failed).sort();if(!input||!groups.length)return;const panel=document.createElement('div');panel.style.cssText='margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:8px';const title=document.createElement('div');title.textContent='按错误类型删除 Key（勾选后删除，只改表单，点击“保存上游”后生效）：';panel.append(title);const boxes=groups.map(g=>{const label=document.createElement('label');label.style.cssText='display:block;margin:4px 0;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.value=g;label.append(cb,' '+g+'（'+failed[g].length+' 个）');panel.append(label);return cb});const actions=document.createElement('div');actions.style.marginTop='6px';const del=document.createElement('button');del.type='button';del.className='btn btn-danger';del.textContent='删除选中的 Key';const note=document.createElement('span');note.style.marginLeft='8px';del.onclick=()=>{const picked=boxes.filter(b=>b.checked&&!b.disabled);if(!picked.length){note.textContent='请先勾选要删除的错误类型';return}const keys=picked.flatMap(b=>failed[b.value]);const before=input.value;const after=removeKeyLines(before,keys);input.value=after;updateUpstreamCardSummary(input);picked.forEach(b=>{b.disabled=true});note.textContent='已从表单删除 '+keys.length+' 个 Key（'+picked.map(b=>b.value).join('、')+'）。';const undo=document.createElement('button');undo.type='button';undo.className='btn btn-secondary';undo.style.marginLeft='8px';undo.textContent='撤销';undo.onclick=()=>{if(input.value!==after){note.textContent='Key 已被修改，无法撤销。';undo.remove();return}input.value=before;updateUpstreamCardSummary(input);picked.forEach(b=>{b.disabled=false});note.textContent='已撤销，恢复 '+keys.length+' 个 Key。';undo.remove()};note.append(undo)};actions.append(del,note);panel.append(actions);box.insertBefore(panel,box.children[1]||null)}
 async function batchTestModels(btn){const card=btn.closest('.upstream-item');const value=field=>(card.querySelector('[data-field="'+field+'"]')||{}).value||'';const box=card.querySelector('.batch-model-result');if(box.querySelector('.batch-model-panel')){const sb=box.querySelector('.batch-model-panel button');if(sb&&sb._abort)sb._abort.abort();box.textContent='';btn.textContent='批量测试模型';return}btn.textContent='收起批量测试';const baseURL=value('base_url').trim();const apiKey=value('api_key');const apiType=value('api_type');const tokenParam=value('test_token_parameter');const modelsRaw=value('custom_models');const models=Array.from(new Set(String(modelsRaw||'').split(',').map(s=>s.trim()).filter(Boolean))).sort(modelNameCollator.compare);box.textContent='';const failHint=t=>{box.textContent=t;btn.textContent='批量测试模型'};if(!baseURL){failHint('请先填写 Base URL');return}if(!models.length){failHint('请先填写自定义模型');return}const exit=selectedTestProxy(card);if(exit===undefined){failHint('所选代理出口已不在代理表中，请重新选择');return}const panel=document.createElement('div');panel.className='batch-model-panel';panel.style.cssText='margin-top:8px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)';const header=document.createElement('div');header.style.cssText='font-size:13px;margin-bottom:10px;color:var(--text)';header.innerHTML='<b>选择要测试的模型</b> <span style="color:var(--text-ter)">（使用第一个 Key，走所选出口）</span>';panel.append(header);const selAll=document.createElement('label');selAll.style.cssText='margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border);font-weight:600';const selAllCb=document.createElement('input');selAllCb.type='checkbox';selAllCb.checked=true;selAllCb.onchange=()=>cbs.forEach(c=>c.checked=selAllCb.checked);const selAllTxt=document.createElement('span');selAllTxt.textContent='全选 / 取消全选（共 '+models.length+' 个）';selAllTxt.style.fontFamily='var(--font)';selAll.append(selAllCb,selAllTxt);panel.append(selAll);const grid=document.createElement('div');grid.className='batch-model-grid';const cbs=models.map(m=>{const label=document.createElement('label');label.title=m;const cb=document.createElement('input');cb.type='checkbox';cb.value=m;cb.checked=true;const txt=document.createElement('span');txt.textContent=m;label.append(cb,txt);grid.append(label);return cb});panel.append(grid);const actions=document.createElement('div');actions.style.cssText='margin-top:12px;padding-top:10px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-wrap:wrap';const startBtn=document.createElement('button');startBtn.type='button';startBtn.className='btn btn-secondary';startBtn.textContent='开始测试';const statusSpan=document.createElement('span');actions.append(startBtn,statusSpan);panel.append(actions);const resultBox=document.createElement('div');resultBox.style.cssText='margin-top:8px';panel.append(resultBox);box.append(panel);startBtn.onclick=async()=>{const selected=cbs.filter(c=>c.checked).map(c=>c.value);if(!selected.length){statusSpan.textContent='请至少选择一个模型';return}if(startBtn._abort){startBtn._abort.abort();return}const controller=new AbortController();startBtn._abort=controller;startBtn.textContent='停止测试';cbs.forEach(c=>c.disabled=true);resultBox.innerHTML='';const summary=document.createElement('div');summary.setAttribute('role','status');summary.style.fontWeight='600';resultBox.append(summary);const results=selected.map(m=>({model:m,state:'pending',ms:0,ttfb:0,msg:''}));const rows=results.map(r=>{const row=document.createElement('div');row.style.cssText='padding:3px 0;font-size:13px;overflow-wrap:anywhere';resultBox.append(row);return row});const renderRow=(i)=>{const r=results[i],row=rows[i];const map={pending:['…','测试中',''],ok:['✓','可用','var(--green)'],fail:['✗','不可用','var(--red)'],limited:['!','受限','var(--orange)'],stopped:['–','已停止','']};const s=map[r.state]||map.fail;row.innerHTML='<span style="color:'+s[2]+'">'+s[0]+' '+s[1]+'</span> · '+esc(r.model)+(r.ms?' · '+r.ms+' ms':'')+(r.ttfb?' (首字节 '+r.ttfb+' ms)':'')+(r.msg?' · '+esc(r.msg):'')};results.forEach((_,i)=>renderRow(i));let done=0;const updateSummary=(final)=>{const ok=results.filter(r=>r.state==='ok').length;summary.textContent=(final?(controller.signal.aborted?'测试已停止':'测试完成'):'测试中 '+done+'/'+selected.length)+' · '+proxyLabel(exit)+'：可用 '+ok+' / '+selected.length};updateSummary(false);let next=0;const worker=async()=>{while(next<results.length){const i=next++,r=results[i];if(controller.signal.aborted){r.state='stopped'}else{renderRow(i);const req=new AbortController(),stop=()=>req.abort();controller.signal.addEventListener('abort',stop);const timer=setTimeout(stop,65000);try{const resp=await fetch('/api/upstream/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:baseURL,api_key:apiKey,api_type:apiType,model:r.model,token_limit_parameter:tokenParam,proxy:exit}),signal:req.signal});if(resp.redirected){controller.abort();throw new Error('登录已过期')}if(!resp.ok)throw new Error((await resp.text()).trim());const d=await resp.json();r.ms=d.latency_ms||0;r.ttfb=d.ttfb_ms||0;if(d.success){r.state='ok'}else if(d.key_status==='limited'){r.state='limited';r.msg=d.error||''}else{r.state='fail';r.msg=d.error||''}}catch(e){if(e.name==='AbortError'&&controller.signal.aborted)r.state='stopped';else{r.state='fail';r.msg=e.name==='AbortError'?'请求超时':e.message}}finally{clearTimeout(timer);controller.signal.removeEventListener('abort',stop)}}done++;renderRow(i);updateSummary(false)}};try{await Promise.all(Array.from({length:selected.length},worker))}finally{startBtn._abort=null;startBtn.textContent='重新测试';cbs.forEach(c=>c.disabled=false);updateSummary(true);const sorted=results.filter(r=>r.state==='ok').sort((a,b)=>a.ms-b.ms);if(sorted.length){const sortDiv=document.createElement('div');sortDiv.style.cssText='margin-top:8px;padding:8px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:13px;line-height:1.7';sortDiv.innerHTML='<b>可用模型（按延迟排序）：</b><br>'+sorted.map((r,i)=>(i+1)+'. '+esc(r.model)+' — '+r.ms+' ms'+(r.ttfb?' (首字节 '+r.ttfb+' ms)':'')).join('<br>');resultBox.append(sortDiv)}}}}
 function buildModelListByUpstreamFromCustomModels(){const grouped={};Object.keys(upstreamData).forEach(name=>{const arr=(upstreamData[name]&&Array.isArray(upstreamData[name].custom_models))?upstreamData[name].custom_models:(typeof (upstreamData[name]||{}).custom_models==='string'?(upstreamData[name].custom_models.split(',').map(s=>s.trim()).filter(Boolean)):[]);grouped[name]=Array.from(new Set(arr)).sort()});return grouped}
 function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||''}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:''}}});aliasData=next}
